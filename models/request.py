@@ -30,6 +30,12 @@ class OdooRequest:
     pAManager: object 
     status: str
     ragStatus: str
+    requestNo: str = ""
+    actionDate: Optional[str] = None
+    DaysSinceRequestIsRaised: Optional[int] = None
+    createOn: Optional[str] = None
+    resolutionDate: Optional[str] = None
+    closedOn: Optional[str] = None
 
 
 @dataclass
@@ -44,3 +50,10 @@ class FlaskRequestPayload:
     status: str = "Initiated"
     rag_status: str = "Green"
     otp_required: bool = False
+    request_no: Optional[str] = None
+    action_date: Optional[str] = None
+    days_since_raised: Optional[int] = None
+    created_on: Optional[str] = None
+    resolution_date: Optional[str] = None
+    closed_on: Optional[str] = None
+
