@@ -28,10 +28,12 @@ class FlaskLoader:
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url.rstrip("/")
         self.headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Host": os.getenv("FLASK_TENANT_DOMAIN")
-    }
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        tenant_domain = os.getenv("FLASK_TENANT_DOMAIN")
+        if tenant_domain:
+            self.headers["Host"] = tenant_domain.strip()
 
     def load_from_csv(self, csv_filename: str, endpoint: str):
         input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
@@ -66,6 +68,16 @@ class FlaskLoader:
 
             if request_type_id:
                 record_data["request_type_id"] = request_type_id
+
+            # assigned_users comes from the transform as a string repr of an ID
+            # list (e.g. "[5]"); parse it back to a real list so the backend's
+            # /request/create receives valid IDs.
+            au_str = record_data.get("assigned_users")
+            if au_str and isinstance(au_str, str):
+                try:
+                    record_data["assigned_users"] = ast.literal_eval(au_str)
+                except Exception:
+                    record_data.pop("assigned_users", None)
 
             if not record_data.get("phone"):
                 record_data["phone"] = "0000000000"
@@ -147,7 +159,7 @@ class FlaskLoader:
                             name_to_id[str(u["name"]).strip().lower()] = u["id"]
                     
                     pagination = data.get("pagination", {})
-                    total_pages = pagination.get("total_page", 1)
+                    total_pages = pagination.get("totalPages", pagination.get("total_page", 1))
                     if page >= total_pages:
                         break
                     page += 1
@@ -316,6 +328,10 @@ class FlaskLoader:
         existing_names = self._fetch_existing_template_names()
         pa_map = self._resolve_pa_ids()
 
+        # name -> Flask id captured from each create response, so a follow-up
+        # approval pass in the same run can skip the GET lookup.
+        created_ids = {}
+
         success_count = 0
         skip_count = 0
         failure_count = 0
@@ -346,15 +362,17 @@ class FlaskLoader:
                 except Exception as e:
                     logger.warning(f"Error parsing processing_activity_names for template '{name}': {e}")
 
+            # Templates are created as Draft (approval=False). Activation is done
+            # separately by hitting the approval API after load (TODO: pending
+            # confirmation). Backend ignores any `status` field on create.
             payload = {
                 "name": name,
-                "template_type": str(row.get("template_type") or "Email Template"),
+                "template_type": str(row.get("template_type") or "Legacy Consent Email Template"),
                 "sub_type": str(row.get("sub_type") or "Email"),
                 "language": str(row.get("language") or "English"),
                 "email_body": str(row.get("email_body") or "(no content)"),
                 "is_default": bool(row.get("is_default", False)),
                 "enable_granular_consent": bool(row.get("is_granular", False)),
-                "status": str(row.get("status") or "Active"),
                 "approval": False,
             }
             subject = row.get("subject")
@@ -374,7 +392,10 @@ class FlaskLoader:
                     timeout=30,
                 )
                 if response.status_code in (200, 201):
-                    logger.info(f"Created template '{name}'")
+                    new_id = (response.json().get("data") or {}).get("id")
+                    if new_id:
+                        created_ids[name] = new_id
+                    logger.info(f"Created template '{name}' (id={new_id})")
                     success_count += 1
                     existing_names.add(name)
                 else:
@@ -388,6 +409,115 @@ class FlaskLoader:
             f"Template load complete: {success_count} created, "
             f"{skip_count} skipped, {failure_count} failed."
         )
+        return created_ids
+
+    def approve_templates(self, csv_filename: str, id_map: dict = None):
+        """Activate templates that were loaded as Draft.
+
+        Templates are created via /create with approval=False (=> Draft). The
+        create endpoint ignores `status`. Activation goes through
+        PUT /notice-templates/<id>, which only flips to Active when BOTH
+        approval=True AND status="Active" are sent. effective_from is persisted
+        only when approval is True.
+
+        Resolves name->id fresh via GET (the create-time IDs don't survive
+        across runs), then PUTs each template whose processed status is Active.
+        """
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"CSV not found: {input_path}")
+            return
+
+        df = pd.read_csv(input_path)
+        df = df.where(pd.notnull(df), None)
+        logger.info(f"Loaded {len(df)} template records from {csv_filename} for approval")
+
+        # Prefer the stash captured at load time; fall back to a GET lookup
+        # (and use it to fill any names missing from the stash).
+        id_map = dict(id_map) if id_map else {}
+        names_needed = {str(r.get("name", "")).strip() for _, r in df.iterrows()}
+        if not id_map or not names_needed.issubset(id_map.keys()):
+            fetched = self._fetch_template_id_map()
+            for k, v in fetched.items():
+                id_map.setdefault(k, v)
+
+        approved = 0
+        skipped = 0
+        failed = 0
+
+        for _, row in df.iterrows():
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+
+            if str(row.get("status") or "Active").strip().lower() != "active":
+                skipped += 1
+                continue
+
+            template_id = id_map.get(name)
+            if not template_id:
+                logger.warning(f"Template '{name}' not found in Flask; cannot approve.")
+                failed += 1
+                continue
+
+            payload = {"approval": True, "status": "Active"}
+            eff = row.get("effective_from")
+            if eff:
+                payload["effective_from"] = str(eff)
+
+            try:
+                response = requests.put(
+                    f"{self.base_url}/notice-templates/{template_id}",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=30,
+                )
+                if response.status_code in (200, 201):
+                    logger.info(f"Approved template '{name}' (id={template_id})")
+                    approved += 1
+                else:
+                    logger.error(f"Approve failed '{name}': {response.status_code} - {response.text[:300]}")
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception approving template '{name}': {e}")
+                failed += 1
+
+        logger.info(
+            f"Template approval complete: {approved} approved, "
+            f"{skipped} skipped (non-Active), {failed} failed."
+        )
+
+    def _fetch_template_id_map(self) -> dict:
+        """Fetch all templates from Flask and map name -> id (paginated)."""
+        name_to_id = {}
+        try:
+            page = 1
+            while True:
+                response = requests.get(
+                    f"{self.base_url}/notice-templates/",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 100},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    logger.warning(f"Could not fetch templates: {response.status_code} - {response.text[:200]}")
+                    break
+                body = response.json()
+                data = body.get("data", {})
+                records = data.get("records", data.get("templates", [])) if isinstance(data, dict) else []
+                if not records:
+                    break
+                for r in records:
+                    if isinstance(r, dict) and "name" in r and "id" in r:
+                        name_to_id[str(r["name"]).strip()] = r["id"]
+                pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+                total_pages = pagination.get("totalPages", pagination.get("total_page", 1))
+                if page >= (total_pages or 1):
+                    break
+                page += 1
+        except Exception as e:
+            logger.warning(f"Error fetching template id map: {e}")
+        return name_to_id
 
     def _fetch_existing_template_names(self) -> set:
         """Fetch all template names already in Flask for the active tenant."""
@@ -432,44 +562,134 @@ class FlaskLoader:
             logger.warning(f"Could not fetch PA list from Flask API: {e}")
         return {}
 
-    def load_deemed_via_import(self, csv_filename: str):
+    # Map a ProcessingTypeEnum *value* to the enum *member name* the Flask
+    # importer's parse_form_data() looks up (ProcessingTypeEnum[NAME.upper()]).
+    # Sending the value ("Mandatory/Regulatory") would KeyError and silently
+    # default to MANDATORY, so Promotional would never propagate.
+    _PROCESSING_TYPE_FORM = {
+        "promotional": "PROMOTIONAL",
+        "mandatory/regulatory": "MANDATORY",
+    }
+
+    def load_legacy_via_import(self, csv_filename: str):
+        """Load DIGITAL (legacy) consents via /consent/import mode=LEGACY.
+
+        Backend behaviour (process_excel_file): status is forced to
+        "Deemed Consent", legacyType to "Legacy", and consentType is read from
+        the form — sending "LEGACY" there is not a valid ConsentTypeEnum name so
+        it defaults to DIGITAL, which is exactly what we want for these records.
+        per-row processingType comes from the "User Activity Type" column.
+
+        Anomalies (backend limitation, no date column on the legacy importer):
+          * the original consent date is NOT preserved (created_at = now)
+          * a consent-seeking notice email is sent per record
+        """
         input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
         if not os.path.exists(input_path):
-            logger.error(f"Deemed consent CSV not found: {input_path}")
+            logger.error(f"Legacy consent CSV not found: {input_path}")
             return
 
         df = pd.read_csv(input_path)
         if df.empty:
-            logger.info("No deemed consent records to load.")
+            logger.info("No legacy consent records to load.")
             return
 
-        logger.info(f"Loaded {len(df)} deemed consent records from {csv_filename}")
+        logger.info(f"Loaded {len(df)} legacy (digital) consent records from {csv_filename}")
 
-        group_cols = ["processingType", "consentType", "legacyType"]
-        for col in group_cols:
-            if col not in df.columns:
-                df[col] = "Legacy" if col == "legacyType" else (
-                    "Digital" if col == "consentType" else "Mandatory/Regulatory"
-                )
-        df[group_cols] = df[group_cols].fillna("Unknown")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Consent Import"
+        ws.append([
+            "Processing Activities", "Language", "Name",
+            "Email", "Mobile", "Identifier", "User Activity Type",
+        ])
+
+        for _, row in df.iterrows():
+            ws.append([
+                str(row.get("processing_activity_name") or ""),
+                "English",
+                str(row.get("name") or ""),
+                str(row.get("email") or ""),
+                str(row.get("phone") or ""),
+                str(row.get("odoo_source_id") or ""),
+                str(row.get("processingType") or "Mandatory/Regulatory"),
+            ])
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/consent/import",
+                headers={k: v for k, v in self.headers.items() if k != "Content-Type"},
+                files={
+                    "file": (
+                        "legacy_consents.xlsx",
+                        buffer,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+                data={
+                    "consentType": "LEGACY",   # import MODE (=> stored consentType Digital)
+                    "legacyType": "LEGACY",
+                    "channel": "EMAIL",
+                },
+                timeout=180,
+            )
+
+            if response.status_code in (200, 201):
+                logger.info(f"Legacy import: {len(df)} records submitted. {response.text[:300]}")
+            else:
+                logger.error(f"Legacy import failed: {response.status_code} — {response.text[:400]}")
+        except Exception as e:
+            logger.exception(f"Exception during legacy import: {e}")
+
+    def load_paper_via_import(self, csv_filename: str):
+        """Load PAPER consents via /consent/import mode=PAPER.
+
+        Backend behaviour (process_paper_excel_file) preserves the per-row
+        "Consent Date" (-> created_at / consented_on) and "Consent Status", and
+        sets consentType from the form (=> "Paper"). Batched per processingType
+        so the form's processingType maps to a valid enum member name.
+
+        Anomaly: legacyType is hardcoded to "Legacy" by the backend, and a
+        privacy-notice email is sent per record.
+        """
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"Paper consent CSV not found: {input_path}")
+            return
+
+        df = pd.read_csv(input_path)
+        if df.empty:
+            logger.info("No paper consent records to load.")
+            return
+
+        logger.info(f"Loaded {len(df)} paper consent records from {csv_filename}")
+
+        if "processingType" not in df.columns:
+            df["processingType"] = "Mandatory/Regulatory"
+        df["processingType"] = df["processingType"].fillna("Mandatory/Regulatory")
 
         total_success = 0
         total_failure = 0
 
-        for group_keys, group_df in df.groupby(group_cols):
-            processing_type, consent_type, legacy_type = group_keys
-            batch_label = (
-                f"{legacy_type}_{consent_type}_{processing_type}"
-                .replace("/", "-").replace(" ", "_")
+        for processing_type, group_df in df.groupby("processingType"):
+            form_processing_type = self._PROCESSING_TYPE_FORM.get(
+                str(processing_type).strip().lower(), "MANDATORY"
             )
-            logger.info(f"Sending batch '{batch_label}' ({len(group_df)} records)...")
+            batch_label = str(processing_type).replace("/", "-").replace(" ", "_")
+            logger.info(f"Sending paper batch '{batch_label}' ({len(group_df)} records)...")
 
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "Consent Import"
             ws.append([
-                "Processing Activities", "Language", "Name",
-                "Email", "Mobile", "Identifier", "User Activity Type",
+                "Processing Activities", "Language", "Name", "Email",
+                "Mobile", "Identifier", "User Activity Type",
+                "Consent Date", "Consent Status", "Comments",
+                "File Path of Digital Consent",
             ])
 
             for _, row in group_df.iterrows():
@@ -480,7 +700,11 @@ class FlaskLoader:
                     str(row.get("email") or ""),
                     str(row.get("phone") or ""),
                     str(row.get("odoo_source_id") or ""),
-                    str(processing_type or "Mandatory/Regulatory"),
+                    str(row.get("processingType") or "Mandatory/Regulatory"),
+                    str(row.get("consent_date") or ""),
+                    str(row.get("status") or "Deemed Consent"),
+                    "",
+                    "",
                 ])
 
             buffer = BytesIO()
@@ -493,105 +717,41 @@ class FlaskLoader:
                     headers={k: v for k, v in self.headers.items() if k != "Content-Type"},
                     files={
                         "file": (
-                            f"{batch_label}.xlsx",
+                            f"paper_{batch_label}.xlsx",
                             buffer,
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
                     },
                     data={
-                        "legacyType": legacy_type,
-                        "consentType": consent_type,
-                        "processingType": processing_type,
+                        "consentType": "PAPER",            # import MODE (=> stored consentType Paper)
+                        "processingType": form_processing_type,
                     },
-                    timeout=120,
+                    timeout=180,
                 )
 
-                if response.status_code in [200, 201]:
-                    logger.info(f"Batch '{batch_label}': {len(group_df)} records imported.")
+                if response.status_code in (200, 201):
+                    logger.info(f"Paper batch '{batch_label}': {len(group_df)} records submitted. {response.text[:300]}")
                     total_success += len(group_df)
                 else:
-                    logger.error(f"Batch '{batch_label}' failed: {response.status_code} — {response.text[:400]}")
+                    logger.error(f"Paper batch '{batch_label}' failed: {response.status_code} — {response.text[:400]}")
                     total_failure += len(group_df)
-
             except Exception as e:
-                logger.exception(f"Exception during batch '{batch_label}': {e}")
+                logger.exception(f"Exception during paper batch '{batch_label}': {e}")
                 total_failure += len(group_df)
 
-        logger.info(f"Deemed import complete: {total_success} succeeded, {total_failure} failed.")
-
-    def load_live_via_live_consent(self, csv_filename: str):
-        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
-        if not os.path.exists(input_path):
-            logger.error(f"Live consent CSV not found: {input_path}")
-            return
-
-        df = pd.read_csv(input_path)
-        if df.empty:
-            logger.info("No live consent records to load.")
-            return
-
-        logger.info(f"Loaded {len(df)} live consent records from {csv_filename}")
-
-        pa_map = self._resolve_pa_ids()
-        if not pa_map:
-            logger.warning("PA name→ID map is empty. Records will post without processing_activity_id.")
-
-        success_count = 0
-        failure_rows = []
-        error_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
-
-        for index, row in df.iterrows():
-            pa_name = row.get("processing_activity_name")
-            pa_id = pa_map.get(str(pa_name).strip()) if pd.notna(pa_name) and pa_name else None
-
-            payload = {
-                "name": str(row.get("name") or ""),
-                "email": str(row.get("email") or "").lower().strip(),
-                "phone": str(row.get("phone") or ""),
-                "processing_activity_id": pa_id,
-                "otp_required": False,
-                "accept_terms": True,
-            }
-
-            try:
-                response = requests.post(
-                    f"{self.base_url}/consent/live-consent",
-                    headers=self.headers,
-                    json=payload,
-                    timeout=30,
-                )
-
-                if response.status_code in [200, 201]:
-                    logger.info(f"Live consent {index + 1}/{len(df)}: created.")
-                    success_count += 1
-                elif response.status_code == 400 and "already exists" in response.text.lower():
-                    logger.info(f"Live consent {index + 1}/{len(df)}: already exists, skipping.")
-                    success_count += 1
-                else:
-                    logger.error(f"Live consent {index + 1}/{len(df)} failed: {response.status_code} — {response.text[:300]}")
-                    failure_rows.append({**payload, "error_status_code": response.status_code, "error_message": response.text})
-
-            except Exception as e:
-                logger.exception(f"Exception on live consent {index + 1}: {e}")
-                failure_rows.append({**payload, "error_message": str(e)})
-
-        if failure_rows:
-            pd.DataFrame(failure_rows).to_csv(error_file, index=False)
-            logger.error(f"{len(failure_rows)} failures written to {error_file}")
-
-        logger.info(f"Live consent complete: {success_count} succeeded, {len(failure_rows)} failed.")
+        logger.info(f"Paper import complete: {total_success} submitted, {total_failure} failed.")
 
 
 def run_loading(csv_filename: str, endpoint: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_from_csv(csv_filename, endpoint)
 
 
-def run_deemed_loading(csv_filename: str):
-    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_deemed_via_import(csv_filename)
+def run_legacy_loading(csv_filename: str):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_legacy_via_import(csv_filename)
 
 
-def run_live_loading(csv_filename: str):
-    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_live_via_live_consent(csv_filename)
+def run_paper_loading(csv_filename: str):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_paper_via_import(csv_filename)
 
 
 def run_pa_loading(csv_filename: str):
@@ -600,6 +760,18 @@ def run_pa_loading(csv_filename: str):
 
 def run_template_loading(csv_filename: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_templates(csv_filename)
+
+
+def run_template_approval(csv_filename: str):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).approve_templates(csv_filename)
+
+
+def run_template_load_and_approve(csv_filename: str):
+    """Load templates (Draft) then approve them in one run, reusing the
+    name->id stash from the create responses to skip the GET lookup."""
+    loader = FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY)
+    created_ids = loader.load_templates(csv_filename)
+    loader.approve_templates(csv_filename, id_map=created_ids)
 
 
 if __name__ == "__main__":
