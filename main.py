@@ -13,13 +13,16 @@ from scripts.transform.transform_processing_activity import transform_processing
 from scripts.transform.transform_template import transform_template_data
 from scripts.load.load_flask import (
     run_loading,
-    run_deemed_loading,
-    run_live_loading,
+    run_legacy_loading,
+    run_paper_loading,
     run_pa_loading,
     run_template_loading,
+    run_template_approval,
+    run_template_load_and_approve,
 )
 
 # Setup logging
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -70,10 +73,10 @@ def load():
     """Stage 2: Split & Load data into Flask API"""
     logger.info("Starting split consent load...")
     try:
-        click.echo("Loading deemed consents → /consent/import...")
-        run_deemed_loading("processed_consents_deemed.csv")
-        click.echo("Loading live consents → /consent/live-consent...")
-        run_live_loading("processed_consents_live.csv")
+        click.echo("Loading paper consents → /consent/import (mode=PAPER)...")
+        run_paper_loading("processed_consents_paper.csv")
+        click.echo("Loading legacy (digital) consents → /consent/import (mode=LEGACY)...")
+        run_legacy_loading("processed_consents_legacy.csv")
         click.echo("Consent loading complete. Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Loading failed: {e}")
@@ -89,13 +92,13 @@ def run_all():
         
         click.echo("Stage 1.5: Transforming...")
         transform_consent_data("raw_consents.csv", "processed_consents.csv")
-        
-        click.echo("Stage 2: Loading deemed consents → /consent/import...")
-        run_deemed_loading("processed_consents_deemed.csv")
-        
-        click.echo("Stage 2: Loading live consents → /consent/live-consent...")
-        run_live_loading("processed_consents_live.csv")
-        
+
+        click.echo("Stage 2: Loading paper consents → /consent/import (mode=PAPER)...")
+        run_paper_loading("processed_consents_paper.csv")
+
+        click.echo("Stage 2: Loading legacy (digital) consents → /consent/import (mode=LEGACY)...")
+        run_legacy_loading("processed_consents_legacy.csv")
+
         click.echo("Full consent pipeline completed.")
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
@@ -121,11 +124,12 @@ def extract():
         click.echo(f"Error: {e}", err=True)
 
 @request.command()
-def transform():
+@click.option("--user-id", "user_id", type=int, default=None, help="Flask user_id to set as assigned_users on every request")
+def transform(user_id):
     """Stage 1.5: Transform data to Flask format"""
     logger.info("Starting request transformation...")
     try:
-        transform_request_data("raw_requests.csv", "processed_requests.csv")
+        transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
         click.echo("Transformation complete. Check data/processed/processed_requests.csv")
     except Exception as e:
         logger.error(f"Transformation failed: {e}")
@@ -143,15 +147,16 @@ def load():
         click.echo(f"Error: {e}", err=True)
 
 @request.command()
-def run_all():
+@click.option("--user-id", "user_id", type=int, default=None, help="Flask user_id to set as assigned_users on every request")
+def run_all(user_id):
     """Run full pipeline: Extract → Transform → Load"""
     logger.info("Starting full request migration pipeline")
     try:
         click.echo("Stage 1: Extracting...")
         run_extraction("/dpgr/dashboard", "raw_requests.csv")
-        
+
         click.echo("Stage 1.5: Transforming...")
-        transform_request_data("raw_requests.csv", "processed_requests.csv")
+        transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
         
         click.echo("Stage 2: Loading...")
         run_loading("processed_requests.csv", "/request/create")
@@ -268,13 +273,37 @@ def transform():
 
 @template.command()
 def load():
-    """Stage 2: Load templates into Flask (idempotent by name)"""
+    """Stage 2: Load templates into Flask as Draft (idempotent by name)"""
     logger.info("Starting Template load...")
     try:
         run_template_loading("processed_templates.csv")
-        click.echo("Template loading complete. Check logs/migration.log for details.")
+        click.echo("Template loading complete (Draft). Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Loading failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@template.command()
+def approve():
+    """Stage 2.5: Activate loaded Draft templates (PUT approval=Active)"""
+    logger.info("Starting Template approval...")
+    try:
+        run_template_approval("processed_templates.csv")
+        click.echo("Template approval complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Approval failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@template.command(name="load-approve")
+def load_approve():
+    """Stage 2: Load then approve templates in one run (reuses id stash)"""
+    logger.info("Starting Template load + approve...")
+    try:
+        run_template_load_and_approve("processed_templates.csv")
+        click.echo("Template load + approve complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Load+approve failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 
