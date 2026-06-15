@@ -69,6 +69,27 @@ def parse_tuple_string(tuple_str) -> list:
         return [None, tuple_str]
 
 
+def format_consent_date(raw) -> str:
+    """Normalise an Odoo timestamp to the dd/mm/YYYY string the Flask paper
+    importer expects (it parses with strptime "%d/%m/%Y"). Returns "" when
+    unparseable so the importer falls back to its own default."""
+    if raw is None or pd.isna(raw):
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return pd.to_datetime(s, format=fmt).strftime("%d/%m/%Y")
+        except (ValueError, TypeError):
+            continue
+    # Last resort: let pandas guess
+    try:
+        return pd.to_datetime(s).strftime("%d/%m/%Y")
+    except Exception:
+        return ""
+
+
 def transform_consent_data(input_filename: str, output_filename: str):
     input_path = os.path.join(DATA_RAW_DIR, input_filename)
     if not os.path.exists(input_path):
@@ -92,6 +113,12 @@ def transform_consent_data(input_filename: str, output_filename: str):
             manager_field = parse_tuple_string(row.get("pAManager"))
             manager_name = manager_field[1] if len(manager_field) > 1 else None
 
+            # Consent date: prefer sentOn (when the notice/consent was recorded),
+            # fall back to deliveredOn. Only the Flask PAPER importer keeps this.
+            consent_date = format_consent_date(row.get("sentOn"))
+            if not consent_date:
+                consent_date = format_consent_date(row.get("deliveredOn"))
+
             record = {
                 "odoo_source_id": row.get("id"),
                 "name": name,
@@ -104,6 +131,7 @@ def transform_consent_data(input_filename: str, output_filename: str):
                 "legacyType": map_legacy_type(row.get("legacyType", "legacy")),
                 "consentType": map_consent_type(row.get("paperType", "digital")),
                 "processingType": map_processing_type(row.get("userActivityType", "mandatory")),
+                "consent_date": consent_date,
                 "accept_terms": True,
             }
 
@@ -112,8 +140,11 @@ def transform_consent_data(input_filename: str, output_filename: str):
         except Exception as e:
             logger.error(f"Error transforming row {index} (ID: {row.get('id')}): {e}")
 
-    deemed_records = [r for r in transformed_records if r["status"] == "Deemed Consent"]
-    live_records = [r for r in transformed_records if r["status"] != "Deemed Consent"]
+    # Split by consent type, mapping to the two Flask import modes:
+    #   Paper   -> /consent/import mode=PAPER  (keeps consent_date + real status)
+    #   Digital -> /consent/import mode=LEGACY (status forced to Deemed, no date)
+    paper_records = [r for r in transformed_records if r["consentType"] == "Paper"]
+    legacy_records = [r for r in transformed_records if r["consentType"] != "Paper"]
 
     os.makedirs(DATA_PROCESSED_DIR, exist_ok=True)
 
@@ -123,19 +154,19 @@ def transform_consent_data(input_filename: str, output_filename: str):
 
     base = output_filename.replace(".csv", "")
 
-    if deemed_records:
-        pd.DataFrame(deemed_records).to_csv(
-            os.path.join(DATA_PROCESSED_DIR, f"{base}_deemed.csv"), index=False
+    if paper_records:
+        pd.DataFrame(paper_records).to_csv(
+            os.path.join(DATA_PROCESSED_DIR, f"{base}_paper.csv"), index=False
         )
 
-    if live_records:
-        pd.DataFrame(live_records).to_csv(
-            os.path.join(DATA_PROCESSED_DIR, f"{base}_live.csv"), index=False
+    if legacy_records:
+        pd.DataFrame(legacy_records).to_csv(
+            os.path.join(DATA_PROCESSED_DIR, f"{base}_legacy.csv"), index=False
         )
 
     logger.info(
         f"Transformation complete. Total: {len(transformed_records)} | "
-        f"Deemed: {len(deemed_records)} | Live: {len(live_records)}"
+        f"Paper: {len(paper_records)} | Legacy: {len(legacy_records)}"
     )
 
 
