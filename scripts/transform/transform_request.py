@@ -55,7 +55,8 @@ def map_rag_status(odoo_rag: str) -> str:
     return rag if rag in {"Red", "Amber", "Green", "Completed"} else "Green"
 
 
-def transform_request_data(input_filename: str, output_filename: str, default_request_type_id: int = 1):
+def transform_request_data(input_filename: str, output_filename: str, default_request_type_id: int = 1,
+                           assigned_user_id: int = None):
     input_path = os.path.join(DATA_RAW_DIR, input_filename)
     if not os.path.exists(input_path):
         logger.error(f"Input file not found: {input_path}")
@@ -74,8 +75,11 @@ def transform_request_data(input_filename: str, output_filename: str, default_re
                 if isinstance(item, dict) and "name" in item
             ]
 
-            pam_field = parse_tuple_string(row.get("pAManager"))
-            assigned_user_names = [pam_field[1]] if len(pam_field) > 1 and pam_field[1] else []
+            # Assignee is a Flask user_id supplied at transform time (the same
+            # backend user runs the migration / owns these requests). Emitted as
+            # an ID list so the loader can pass it straight to /request/create's
+            # `assigned_users` field.
+            assigned_users = [int(assigned_user_id)] if assigned_user_id else []
 
             record = {
                 "odoo_source_id": row.get("id"),
@@ -84,7 +88,7 @@ def transform_request_data(input_filename: str, output_filename: str, default_re
                 "phone": str(row.get("phone", "")).strip(),
                 "request_type_id": default_request_type_id,
                 "processing_activity_names": processing_activity_names,
-                "assigned_user_names": assigned_user_names,
+                "assigned_users": assigned_users,
                 "status": map_request_status(row.get("status", "Not Assigned")),
                 "rag_status": map_rag_status(row.get("ragStatus", "Green")),
                 "otp_required": False,
