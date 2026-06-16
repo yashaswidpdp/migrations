@@ -132,6 +132,12 @@ def transform_consent_data(input_filename: str, output_filename: str):
                 "consentType": map_consent_type(row.get("paperType", "digital")),
                 "processingType": map_processing_type(row.get("userActivityType", "mandatory")),
                 "consent_date": consent_date,
+                # Odoo source dates -> Flask Consent columns. dd/mm/YYYY matches
+                # the importer's strptime format; "" lets the backend default.
+                "sent_on": format_consent_date(row.get("sentOn")),
+                "delivered_on": format_consent_date(row.get("deliveredOn")),
+                "valid_till": format_consent_date(row.get("validTill")),
+                "consent_reject_on": format_consent_date(row.get("consentRejectOn")),
                 "accept_terms": True,
             }
 
