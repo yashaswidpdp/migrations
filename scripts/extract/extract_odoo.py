@@ -63,7 +63,17 @@ class OdooExtractor:
                     break
                 
                 data = response.json()
-                
+
+                # Odoo wraps auth errors in an HTTP-200 envelope, e.g.
+                # {"message": "Token Expired", "status_code": 401}. Abort loudly
+                # instead of treating it as an empty page.
+                if isinstance(data, dict) and data.get("status_code", 200) != 200:
+                    logger.error(
+                        f"API error envelope on page {page}: {data.get('status_code')} - "
+                        f"{data.get('message')}. Refresh ODOO_JWT_TOKEN in config/.env."
+                    )
+                    break
+
                 # Check where records are nested in the response
                 if isinstance(data, list):
                     records = data
@@ -128,7 +138,17 @@ class OdooExtractor:
             if response.status_code != 200:
                 logger.error(f"Failed: {response.status_code} - {response.text[:300]}")
                 return {}
-            return response.json()
+            data = response.json()
+            # Odoo wraps auth errors in an HTTP-200 envelope, e.g.
+            # {"message": "Token Expired", "status_code": 401}. Catch those so
+            # we don't save a bogus "empty" dataset and silently transform 0 rows.
+            if isinstance(data, dict) and data.get("status_code", 200) != 200:
+                logger.error(
+                    f"API error envelope: {data.get('status_code')} - "
+                    f"{data.get('message')}. Refresh ODOO_JWT_TOKEN in config/.env."
+                )
+                return {}
+            return data
         except Exception as e:
             logger.exception(f"Exception fetching {url}: {e}")
             return {}
