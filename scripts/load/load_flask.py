@@ -225,6 +225,9 @@ class FlaskLoader:
         name_to_id = self._resolve_pa_ids()
         user_map = self._resolve_user_ids()
         default_user_id = self._resolve_current_user_id()
+        # Odoo PA template links carry a NAME; resolve against Flask's template
+        # name→id map (templates are always loaded before PAs).
+        template_map = self._fetch_template_id_map()
 
         success_count = 0
         skip_count = 0
@@ -269,6 +272,35 @@ class FlaskLoader:
             if desc:
                 payload["description"] = str(desc)
 
+            # Odoo effective-from dates -> Flask PA effective_from_* columns
+            # (the /processing/create route reads these keys directly).
+            for col in ("effective_from_email", "effective_from_sms", "effective_from_privacy"):
+                val = row.get(col)
+                # pandas .where(...,None) reverts None->NaN in float cols, so an
+                # empty cell can arrive as float nan -> str(nan)=='nan'. Guard it.
+                if val is not None and not pd.isna(val) and str(val).strip().lower() != "nan":
+                    payload[col] = str(val).strip()
+
+            # Odoo template links (name) -> Flask template_id. Resolve by name;
+            # warn (don't fail the PA) if a referenced template wasn't migrated.
+            for name_col, id_key in (
+                ("consent_email_template_name", "consent_email_template_id"),
+                ("consent_sms_template_name", "consent_sms_template_id"),
+                ("privacy_template_name", "privacy_template_id"),
+            ):
+                tname = row.get(name_col)
+                if tname is None or pd.isna(tname) or not str(tname).strip():
+                    continue
+                tname = str(tname).strip()
+                tid = template_map.get(tname)
+                if tid is not None:
+                    payload[id_key] = tid
+                else:
+                    logger.warning(
+                        f"PA '{name}': template '{tname}' not found in Flask "
+                        f"(skipping {id_key}). Load templates first."
+                    )
+
             try:
                 response = requests.post(
                     f"{self.base_url}/processing/create",
@@ -297,6 +329,111 @@ class FlaskLoader:
         logger.info(
             f"PA load complete: {success_count} created, "
             f"{skip_count} skipped, {failure_count} failed."
+        )
+
+    def patch_processing_activity_links(self, csv_filename: str):
+        """Backfill template links + effective-from dates onto PAs that already
+        exist in Flask (the create pass skips existing PAs, so their template
+        columns stay NULL).
+
+        For each PA row carrying a template name or effective-from date, resolve
+        the template name -> Flask id and PUT /processing/<id> with only those
+        keys. Idempotent: re-running just re-sets the same values.
+
+        Note: PUT's parse_date is strict %Y-%m-%d, so dates are sent date-only.
+        """
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"CSV not found: {input_path}")
+            return
+
+        df = pd.read_csv(input_path)
+        df = df.where(pd.notnull(df), None)  # NaN → None
+        logger.info(f"Loaded {len(df)} PA records from {csv_filename} for link patch")
+
+        name_to_id = self._resolve_pa_ids()
+        template_map = self._fetch_template_id_map()
+
+        patched = 0
+        skipped = 0
+        failed = 0
+
+        for _, row in df.iterrows():
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+
+            pa_id = name_to_id.get(name)
+            if pa_id is None:
+                logger.warning(f"PA '{name}' not found in Flask; cannot patch. Load PAs first.")
+                skipped += 1
+                continue
+
+            payload = {}
+
+            # Template links: name -> Flask id.
+            for name_col, id_key in (
+                ("consent_email_template_name", "consent_email_template_id"),
+                ("consent_sms_template_name", "consent_sms_template_id"),
+                ("privacy_template_name", "privacy_template_id"),
+            ):
+                tname = row.get(name_col)
+                if tname is None or pd.isna(tname) or not str(tname).strip():
+                    continue
+                tname = str(tname).strip()
+                tid = template_map.get(tname)
+                if tid is not None:
+                    payload[id_key] = tid
+                else:
+                    logger.warning(
+                        f"PA '{name}': template '{tname}' not found in Flask "
+                        f"(skipping {id_key})."
+                    )
+
+            # Effective-from dates: PUT wants %Y-%m-%d, transform emits ISO.
+            for col in ("effective_from_email", "effective_from_sms", "effective_from_privacy"):
+                val = row.get(col)
+                if val is not None and not pd.isna(val) and str(val).strip().lower() != "nan":
+                    payload[col] = str(val).strip()[:10]
+
+            # Validity fields: create ignores these (applies company defaults),
+            # so they MUST be set here. Omit when Odoo had no value.
+            for col in ("consent_validity_months", "otp_validity_minutes"):
+                val = row.get(col)
+                if val is not None and not pd.isna(val):
+                    payload[col] = int(val)
+
+            # Visibility flags: backfill in case an earlier load mis-parsed
+            # Odoo 'yes'/'no' (bool('no') was True). PUT accepts these keys.
+            for col in ("is_active", "show_on_dpgr", "show_on_privacy"):
+                val = row.get(col)
+                if val is not None and not pd.isna(val):
+                    payload[col] = bool(val)
+
+            if not payload:
+                skipped += 1
+                continue
+
+            try:
+                response = requests.put(
+                    f"{self.base_url}/processing/{pa_id}",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=30,
+                )
+                if response.status_code in (200, 201):
+                    logger.info(f"Patched PA '{name}' (id={pa_id}): {list(payload.keys())}")
+                    patched += 1
+                else:
+                    logger.error(f"Failed patch PA '{name}': {response.status_code} - {response.text[:300]}")
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception patching PA '{name}': {e}")
+                failed += 1
+
+        logger.info(
+            f"PA link patch complete: {patched} patched, "
+            f"{skipped} skipped, {failed} failed."
         )
 
     # ------------------------------------------------------------------ #
@@ -381,7 +518,7 @@ class FlaskLoader:
             if pa_ids:
                 payload["processing_activity_ids"] = pa_ids
             eff = row.get("effective_from")
-            if eff:
+            if eff is not None and not pd.isna(eff) and str(eff).strip().lower() != "nan":
                 payload["effective_from"] = str(eff)
 
             try:
@@ -462,7 +599,7 @@ class FlaskLoader:
 
             payload = {"approval": True, "status": "Active"}
             eff = row.get("effective_from")
-            if eff:
+            if eff is not None and not pd.isna(eff) and str(eff).strip().lower() != "nan":
                 payload["effective_from"] = str(eff)
 
             try:
@@ -602,6 +739,7 @@ class FlaskLoader:
         ws.append([
             "Processing Activities", "Language", "Name",
             "Email", "Mobile", "Identifier", "User Activity Type",
+            "Consent Date", "Sent On", "Delivered On", "Valid Till", "Reject On",
         ])
 
         for _, row in df.iterrows():
@@ -613,6 +751,11 @@ class FlaskLoader:
                 str(row.get("phone") or ""),
                 str(row.get("odoo_source_id") or ""),
                 str(row.get("processingType") or "Mandatory/Regulatory"),
+                str(row.get("consent_date") or ""),
+                str(row.get("sent_on") or ""),
+                str(row.get("delivered_on") or ""),
+                str(row.get("valid_till") or ""),
+                str(row.get("consent_reject_on") or ""),
             ])
 
         buffer = BytesIO()
@@ -690,6 +833,7 @@ class FlaskLoader:
                 "Mobile", "Identifier", "User Activity Type",
                 "Consent Date", "Consent Status", "Comments",
                 "File Path of Digital Consent",
+                "Sent On", "Delivered On", "Valid Till", "Reject On",
             ])
 
             for _, row in group_df.iterrows():
@@ -705,6 +849,10 @@ class FlaskLoader:
                     str(row.get("status") or "Deemed Consent"),
                     "",
                     "",
+                    str(row.get("sent_on") or ""),
+                    str(row.get("delivered_on") or ""),
+                    str(row.get("valid_till") or ""),
+                    str(row.get("consent_reject_on") or ""),
                 ])
 
             buffer = BytesIO()
@@ -741,6 +889,66 @@ class FlaskLoader:
 
         logger.info(f"Paper import complete: {total_success} submitted, {total_failure} failed.")
 
+    def load_consents_via_migration(self, csv_filename: str):
+        """Load consents (paper + legacy together) via the migration extension
+        endpoint /migration/consent, one JSON record per row.
+
+        Unlike the Excel /consent/import paths, this preserves every Odoo source
+        date (consent_date, sent_on, delivered_on, valid_till, consent_reject_on)
+        and is idempotent via the migration source-map (HTTP 409 => already
+        migrated, skipped). The endpoint reads consentType/status per row, so the
+        combined processed_consents.csv can be loaded directly without splitting.
+        """
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"Consent CSV not found: {input_path}")
+            return
+
+        df = pd.read_csv(input_path)
+        if df.empty:
+            logger.info("No consent records to load.")
+            return
+
+        logger.info(f"Loaded {len(df)} consent records from {csv_filename}")
+        pa_map = self._resolve_pa_ids()
+
+        success = 0
+        failures = []
+        for index, row in df.iterrows():
+            record = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
+
+            pa_name = record.get("processing_activity_name")
+            if pa_name:
+                record["processing_activity_id"] = pa_map.get(str(pa_name).strip())
+            record.pop("manager_name", None)
+
+            try:
+                response = requests.post(
+                    f"{self.base_url}/migration/consent",
+                    headers=self.headers,
+                    json=record,
+                    timeout=60,
+                )
+                if response.status_code in (200, 201):
+                    logger.info(f"Loaded consent {index + 1}/{len(df)}")
+                    success += 1
+                elif response.status_code == 409:
+                    logger.info(f"Consent {index + 1} already migrated. Skipping.")
+                    success += 1
+                else:
+                    logger.error(f"Consent {index + 1} failed: {response.status_code} - {response.text[:300]}")
+                    failures.append({**record, "error": response.text, "status_code": response.status_code})
+            except Exception as e:
+                logger.exception(f"Exception loading consent {index + 1}: {e}")
+                failures.append({**record, "error": str(e)})
+
+        if failures:
+            err_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
+            pd.DataFrame(failures).to_csv(err_file, index=False)
+            logger.error(f"{len(failures)} consent failures written to {err_file}")
+
+        logger.info(f"Consent migration load complete: {success} ok, {len(failures)} failed.")
+
 
 def run_loading(csv_filename: str, endpoint: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_from_csv(csv_filename, endpoint)
@@ -754,8 +962,16 @@ def run_paper_loading(csv_filename: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_paper_via_import(csv_filename)
 
 
+def run_consent_migration_loading(csv_filename: str):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_consents_via_migration(csv_filename)
+
+
 def run_pa_loading(csv_filename: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_processing_activities(csv_filename)
+
+
+def run_pa_link_patch(csv_filename: str):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).patch_processing_activity_links(csv_filename)
 
 
 def run_template_loading(csv_filename: str):
