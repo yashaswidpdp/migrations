@@ -44,7 +44,7 @@ class FlaskRequestPayload:
     name: str
     email: str
     phone: str
-    request_type_id: int             
+    request_type: int             
     processing_activity_names: List[str] = field(default_factory=list)
     assigned_user_names: List[str] = field(default_factory=list)
     status: str = "Initiated"
