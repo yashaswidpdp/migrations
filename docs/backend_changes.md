@@ -6,6 +6,50 @@ If you are pulling new code into your local `dpdp_python` repository before push
 
 This document serves as a ledger of all modifications made to the backend code strictly for ensuring the ETL pipeline works.
 
+---
+
+## 0. Migration Extension — `dpdp_python/migration_ext/` (PREFERRED MECHANISM)
+
+**Why**: Editing real model/route/service files means every `git pull` of upstream
+silently wipes the migration patches (this happened — see Issue 26). To stop that,
+all **migration-specific glue** (date preservation + idempotency) now lives in a
+self-contained package that does **not exist upstream**, so a pull can never touch it.
+
+**Package**: `dpdp_python/migration_ext/`
+- `source_map.py` — a migration-owned `migration_source_map` table
+  (`entity, odoo_source_id, flask_id, tenant_id`, unique per entity+source+tenant).
+  Idempotency lives here, so the real `requests`/`consents` tables need **no**
+  `odoo_source_id` column.
+- `routes.py` — blueprint with `POST /api/migration/request` and
+  `POST /api/migration/consent`:
+  - **request**: reuses `Request.create_request` (so all real business logic is
+    kept), forwards `raised_on` (via payload) + `action_date`/`resolution_date`/
+    `closed_on` (via `**extra_fields`), dedups via the source-map (HTTP 409 → loader
+    skips), and **sends no email** (the route, not the model method, sends mail).
+  - **consent**: inserts `Consent` directly (skipping the template/email machinery a
+    historical backfill doesn't need), preserving `consent_date`/`sent_on`/
+    `delivered_on`/`valid_till`/`consent_reject_on`, dedups via the source-map.
+- `serve.py` — launches the normal app via `create_app()` then registers the
+  blueprint. **No upstream file is edited.**
+
+**How to run** (under an env that has all backend deps + `SECRET_KEY`):
+```bash
+cd dpdp_python
+python -m migration_ext.serve            # dev, port 5000 (or PORT=…)
+# or: gunicorn 'migration_ext.serve:app' -b 0.0.0.0:5000
+```
+The loader points at `/migration/request` and `/migration/consent` (see
+`scripts/load/load_flask.py` + `main.py`). The `migration_source_map` table is
+auto-created on first boot (`checkfirst=True`).
+
+**Consequence**: the migration-specific date + dedup logic is **no longer** edited
+into `consent_import.py` / `request_routes.py` / model files. Sections 1–4 below
+describe fixes that are **genuine upstream behaviour** the migration merely depends
+on (e.g. a NOT NULL `user_role_type` will crash *any* portal-user creation, not just
+migration) — keep those, but they are not migration glue.
+
+---
+
 ## 1. Nullable Nominee Fields (Requests)
 **File**: `models/request.py`
 **Reason**: Historical grievance data from Odoo does not collect nominee information. Previously, these fields were `nullable=False`, causing 64/64 request inserts to fail with `NOT NULL` constraint violations.
