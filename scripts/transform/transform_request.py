@@ -55,8 +55,27 @@ def map_rag_status(odoo_rag: str) -> str:
     return rag if rag in {"Red", "Amber", "Green", "Completed"} else "Green"
 
 
-def transform_request_data(input_filename: str, output_filename: str, default_request_type_id: int = 1,
-                           assigned_user_id: int = None):
+def to_iso_datetime(raw) -> str:
+    """Normalise an Odoo timestamp to ISO 8601 ('YYYY-MM-DDTHH:MM:SS') so the
+    Flask backend can parse it with datetime.fromisoformat. Returns "" when
+    empty/unparseable so the backend falls back to its own default (now)."""
+    if raw is None or pd.isna(raw):
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return pd.to_datetime(s, format=fmt).strftime("%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+    try:
+        return pd.to_datetime(s).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return ""
+
+
+def transform_request_data(input_filename: str, output_filename: str, assigned_user_id: int = None):
     input_path = os.path.join(DATA_RAW_DIR, input_filename)
     if not os.path.exists(input_path):
         logger.error(f"Input file not found: {input_path}")
@@ -86,12 +105,21 @@ def transform_request_data(input_filename: str, output_filename: str, default_re
                 "name": str(row.get("name", "")).strip(),
                 "email": str(row.get("eMail", "")).strip(),
                 "phone": str(row.get("phone", "")).strip(),
-                "request_type_id": default_request_type_id,
+                # Odoo requestNo -> Flask request_no, carried through verbatim.
+                "request_no": str(row.get("requestNo", "")).strip(),
+                "request_type_id": map_request_status(row.get("request_type")),
                 "processing_activity_names": processing_activity_names,
                 "assigned_users": assigned_users,
                 "status": map_request_status(row.get("status", "Not Assigned")),
                 "rag_status": map_rag_status(row.get("ragStatus", "Green")),
                 "otp_required": False,
+                # Odoo source dates -> Flask Request columns. Emitted as ISO so
+                # the backend parses them with datetime.fromisoformat; "" lets
+                # the backend keep its own default (now).
+                "raised_on": to_iso_datetime(row.get("createOn")),
+                "action_date": to_iso_datetime(row.get("actionDate")),
+                "resolution_date": to_iso_datetime(row.get("resolutionDate")),
+                "closed_on": to_iso_datetime(row.get("closedOn")),
             }
 
             transformed_records.append(record)
