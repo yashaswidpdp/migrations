@@ -15,7 +15,9 @@ from scripts.load.load_flask import (
     run_loading,
     run_legacy_loading,
     run_paper_loading,
+    run_consent_migration_loading,
     run_pa_loading,
+    run_pa_link_patch,
     run_template_loading,
     run_template_approval,
     run_template_load_and_approve,
@@ -71,12 +73,10 @@ def transform():
 @consent.command()
 def load():
     """Stage 2: Split & Load data into Flask API"""
-    logger.info("Starting split consent load...")
+    logger.info("Starting consent load via migration extension...")
     try:
-        click.echo("Loading paper consents → /consent/import (mode=PAPER)...")
-        run_paper_loading("processed_consents_paper.csv")
-        click.echo("Loading legacy (digital) consents → /consent/import (mode=LEGACY)...")
-        run_legacy_loading("processed_consents_legacy.csv")
+        click.echo("Loading consents (paper + legacy, dates preserved) → /migration/consent...")
+        run_consent_migration_loading("processed_consents.csv")
         click.echo("Consent loading complete. Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Loading failed: {e}")
@@ -93,11 +93,8 @@ def run_all():
         click.echo("Stage 1.5: Transforming...")
         transform_consent_data("raw_consents.csv", "processed_consents.csv")
 
-        click.echo("Stage 2: Loading paper consents → /consent/import (mode=PAPER)...")
-        run_paper_loading("processed_consents_paper.csv")
-
-        click.echo("Stage 2: Loading legacy (digital) consents → /consent/import (mode=LEGACY)...")
-        run_legacy_loading("processed_consents_legacy.csv")
+        click.echo("Stage 2: Loading consents (paper + legacy, dates preserved) → /migration/consent...")
+        run_consent_migration_loading("processed_consents.csv")
 
         click.echo("Full consent pipeline completed.")
     except Exception as e:
@@ -140,7 +137,7 @@ def load():
     """Stage 2: Load data into Flask API"""
     logger.info("Starting request load...")
     try:
-        run_loading("processed_requests.csv", "/request/create")
+        run_loading("processed_requests.csv", "/migration/request")
         click.echo("Request loading complete. Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Loading failed: {e}")
@@ -159,7 +156,7 @@ def run_all(user_id):
         transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
         
         click.echo("Stage 2: Loading...")
-        run_loading("processed_requests.csv", "/request/create")
+        run_loading("processed_requests.csv", "/migration/request")
         
         click.echo("Full request migration completed successfully.")
     except Exception as e:
@@ -215,6 +212,21 @@ def load():
 
 
 @processing_activity.command()
+def patch_links():
+    """Backfill template links + effective-from onto PAs already in Flask.
+
+    The load pass skips existing PAs, so their template/date columns stay NULL.
+    Run this after templates + PAs are loaded to wire them up (idempotent)."""
+    logger.info("Starting Processing Activity link patch...")
+    try:
+        run_pa_link_patch("processed_processing_activities.csv")
+        click.echo("PA link patch complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Link patch failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@processing_activity.command()
 def run_all():
     """Run full PA pipeline: Extract → Transform → Load"""
     logger.info("Starting full Processing Activity pipeline")
@@ -230,6 +242,9 @@ def run_all():
 
         click.echo("Stage 2: Loading...")
         run_pa_loading("processed_processing_activities.csv")
+
+        click.echo("Stage 3: Patching template links...")
+        run_pa_link_patch("processed_processing_activities.csv")
 
         click.echo("Full PA pipeline completed.")
     except Exception as e:
@@ -309,7 +324,7 @@ def load_approve():
 
 @template.command()
 def run_all():
-    """Run full template pipeline: Extract → Transform → Load"""
+    """Run full template pipeline: Extract → Transform → Load → Approve"""
     logger.info("Starting full Template pipeline")
     try:
         click.echo("Stage 1: Extracting...")
@@ -318,8 +333,11 @@ def run_all():
         click.echo("Stage 1.5: Transforming...")
         transform_template_data("raw_templates.json", "processed_templates.csv")
 
-        click.echo("Stage 2: Loading...")
-        run_template_loading("processed_templates.csv")
+        # Load creates templates as Draft (approval=False); the approve pass
+        # PUTs approval=True + status=Active so they become effective and
+        # effective_from persists (create ignores both unless approval=True).
+        click.echo("Stage 2: Loading + approving...")
+        run_template_load_and_approve("processed_templates.csv")
 
         click.echo("Full template pipeline completed.")
     except Exception as e:
