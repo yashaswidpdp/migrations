@@ -13,6 +13,7 @@ Key mapping:
 import json
 import logging
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv("config/.env")
@@ -22,6 +23,23 @@ DATA_PROCESSED_DIR = os.getenv("DATA_PROCESSED_DIR", "data/processed")
 logger = logging.getLogger("transform_template")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+
+def _to_iso(value) -> str:
+    """Normalise an Odoo effectiveDate to ISO 8601 so the Flask
+    /notice-templates approve route can parse it with datetime.fromisoformat.
+    Returns "" for empty/unparseable values."""
+    if not value or value is False:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+    return ""
 
 
 FLASK_LANGUAGES = {
@@ -147,7 +165,7 @@ def transform_template_data(input_filename: str, output_filename: str):
             "is_granular": bool(tmpl.get("is_granular_consent", False)),
             "status": "Active",
             "processing_activity_names": pa_names,
-            "effective_from": tmpl.get("effectiveDate") or None,
+            "effective_from": _to_iso(tmpl.get("effectiveDate")) or None,
         }
         records.append(record)
 
