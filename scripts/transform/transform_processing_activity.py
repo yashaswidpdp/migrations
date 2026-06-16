@@ -9,6 +9,7 @@ Flask parent IDs at load time.
 import json
 import logging
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv("config/.env")
@@ -26,6 +27,88 @@ ODOO_TO_FLASK_ACTIVITY_TYPE = {
     "Promotional": "Promotional",
     "promotional": "Promotional",
 }
+
+
+def _to_iso(value) -> str:
+    """Normalise an Odoo effective-from value (e.g. '2025-12-12' or
+    '2025-12-12 10:30:00') to ISO 8601 so the Flask /processing/create route can
+    store it. Returns "" for empty/false/unparseable so the loader omits it."""
+    if not value or value is False:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+    return ""
+
+
+def _yes_no(value, default: bool = False) -> bool:
+    """Odoo sends boolean-ish flags as the strings 'yes'/'no' (and sometimes
+    true/false). bool('no') is True in Python, so parse explicitly."""
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in ("yes", "true", "1", "t")
+
+
+def _otp_minutes(value):
+    """Odoo otpExpiryConsent is a duration like '24h' / '30m' / '1d'. Flask
+    stores otp_validity_minutes as an int. Returns None for empty/unparseable
+    so the loader omits it (Flask then keeps its company default)."""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    units = {"d": 1440, "h": 60, "m": 1, "s": 0}
+    if s[-1] in units:
+        try:
+            return int(float(s[:-1]) * units[s[-1]])
+        except ValueError:
+            return None
+    try:
+        return int(float(s))  # bare number -> assume minutes
+    except ValueError:
+        return None
+
+
+def _int_or_none(value):
+    """Parse Odoo consentValidity ('' or '12') to int months, else None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _odoo_ref_id(value):
+    """Odoo M2O fields are [id, "Name"] (or "" / false). Return the numeric id,
+    kept for traceability only — Flask resolves links by name, not Odoo id."""
+    if isinstance(value, (list, tuple)) and len(value) > 0:
+        try:
+            return int(value[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _template_name(value) -> str:
+    """Odoo template M2O fields arrive as [id, "Name"] or "" / false / None.
+
+    The Odoo id is useless to Flask (ids differ post-migration), so we carry the
+    NAME and let the loader resolve it against Flask's template name->id map.
+    Returns None when no template is linked."""
+    if isinstance(value, (list, tuple)) and len(value) > 1:
+        name = str(value[1]).strip()
+        return name or None
+    return None
 
 
 def _parse_array_or_false(value) -> list:
@@ -65,15 +148,33 @@ def _flatten_tree(nodes: list, parent_name: str = None) -> list:
 
         record = {
             "odoo_id": node.get("id"),
+            "odoo_level": node.get("level"),  # tree depth, traceability only
             "name": name,
             "parent_name": parent_name,
             "description": str(node.get("description", "") or "").strip() or None,
             "activity_type": activity_type,
-            "is_active": bool(node.get("isActive", True)),
-            "is_otp": bool(node.get("isOtpMandatory", False)),
-            "show_on_dpgr": bool(node.get("showOnDpgr", False)),
-            "show_on_privacy": bool(node.get("showOnDpia", False)),
+            "is_active": _yes_no(node.get("isActive"), default=True),
+            "is_otp": _yes_no(node.get("isOtpMandatory")),
+            "show_on_dpgr": _yes_no(node.get("showOnDpgr")),
+            "show_on_privacy": _yes_no(node.get("showOnDpia")),
             "manager_name": manager_name,
+            "manager_odoo_id": _odoo_ref_id(node.get("managerId")),
+            # Odoo validity settings -> Flask columns (set via PUT; create
+            # ignores these and would otherwise apply company defaults).
+            "consent_validity_months": _int_or_none(node.get("consentValidity")),
+            "otp_validity_minutes": _otp_minutes(node.get("otpExpiryConsent")),
+            # Odoo effective-from dates -> Flask PA effective_from_* columns.
+            "effective_from_email": _to_iso(node.get("consentEmailEffectiveFrom")),
+            "effective_from_sms": _to_iso(node.get("consentSmsEffectiveFrom")),
+            "effective_from_privacy": _to_iso(node.get("privacyEffectiveFrom")),
+            # Odoo template links (name only; loader resolves to Flask id).
+            "consent_email_template_name": _template_name(node.get("consentEmailTemplateId")),
+            "consent_sms_template_name": _template_name(node.get("consentSmsTemplateId")),
+            "privacy_template_name": _template_name(node.get("privacyTemplateId")),
+            # Odoo template ids — traceability only; Flask links by name.
+            "consent_email_template_odoo_id": _odoo_ref_id(node.get("consentEmailTemplateId")),
+            "consent_sms_template_odoo_id": _odoo_ref_id(node.get("consentSmsTemplateId")),
+            "privacy_template_odoo_id": _odoo_ref_id(node.get("privacyTemplateId")),
         }
         flat.append(record)
 
