@@ -69,6 +69,15 @@ def map_rag_status(odoo_rag: str) -> str:
     return rag if rag in {"Red", "Amber", "Green", "Completed"} else "Green"
 
 
+def map_risk(odoo_rag: str) -> str:
+    """Odoo ragStatus -> Flask Request.risk enum (High | Medium | Low).
+    Red=High, Amber=Medium, Green=Low. A COMPLETED request carries no active
+    SLA risk, so it maps to "" -> the loader leaves Flask risk NULL.
+    Case-insensitive; unknown values also yield "" (NULL)."""
+    rag = str(odoo_rag).strip().title()
+    return {"Red": "High", "Amber": "Medium", "Green": "Low"}.get(rag, "")
+
+
 def to_iso_datetime(raw) -> str:
     """Normalise an Odoo timestamp to ISO 8601 ('YYYY-MM-DDTHH:MM:SS') so the
     Flask backend can parse it with datetime.fromisoformat. Returns "" when
@@ -87,6 +96,18 @@ def to_iso_datetime(raw) -> str:
         return pd.to_datetime(s).strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
         return ""
+
+
+def _clean_phone(value) -> str:
+    """Coerce a phone cell to clean digits. pandas reads the column as float
+    when blanks are present, so '9999999999' arrives as '9999999999.0' and a
+    blank as 'nan'. Strip the float artifact; map missing/garbage -> ''."""
+    s = str(value or "").strip()
+    if not s or s.lower() == "nan":
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
 
 
 def transform_request_data(input_filename: str, output_filename: str, assigned_user_id: int = None):
@@ -124,11 +145,17 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
             # `assigned_users` field.
             assigned_users = [int(assigned_user_id)] if assigned_user_id else []
 
+            email = str(row.get("eMail", "")).strip()
+            # Carry the real (cleaned) phone whenever the source has one. The
+            # loader keys identity on it and falls back to email-only if that
+            # phone collides with a different principal (shared dummy numbers).
+            phone = _clean_phone(row.get("phone"))
+
             record = {
                 "odoo_source_id": row.get("id"),
                 "name": str(row.get("name", "")).strip(),
-                "email": str(row.get("eMail", "")).strip(),
-                "phone": str(row.get("phone", "")).strip(),
+                "email": email,
+                "phone": phone,
                 # Odoo requestNo -> Flask request_no, carried through verbatim.
                 "request_no": str(row.get("requestNo", "")).strip(),
                 # Odoo `requestType [id, name]` from /dpgr/id enrichment. Emit the
@@ -141,12 +168,14 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 "assigned_users": assigned_users,
                 "status": map_request_status(row.get("status", "Not Assigned")),
                 "rag_status": map_rag_status(row.get("ragStatus", "Green")),
+                # Odoo ragStatus -> Flask Request.risk (High/Medium/Low; "" for
+                # Completed -> NULL). Separate from rag_status; never store raw.
+                "risk": map_risk(row.get("ragStatus", "")),
                 "otp_required": False,
                 # Odoo source dates -> Flask Request columns. Emitted as ISO so
                 # the backend parses them with datetime.fromisoformat; "" lets
                 # the backend keep its own default (now).
                 "raised_on": to_iso_datetime(row.get("createOn")),
-                "action_date": to_iso_datetime(row.get("actionDate")),
                 "resolution_date": to_iso_datetime(row.get("resolutionDate")),
                 "closed_on": to_iso_datetime(row.get("closedOn")),
                 # Free-text + escalation + close fields -> Flask Request columns
