@@ -244,6 +244,16 @@ def run_template_extraction(output_file: str, template_type: str = None):
     else:
         logger.error("Template extraction returned empty response.")
 
+
+def run_vendor_extraction(output_file: str = "raw_vendors.json"):
+    """Extract all vendors from Odoo (/vendors_details) and save as JSON."""
+    extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
+    raw = extractor.fetch_simple("/vendors_details")
+    if raw:
+        extractor.save_to_json(raw, output_file)
+    else:
+        logger.error("Vendor extraction returned empty response.")
+
 def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     """Enrich the dashboard request CSV with the per-record by-id fields the
     dashboard omits — chiefly `requestType [id, name]`, plus the assignee
