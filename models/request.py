@@ -36,6 +36,18 @@ class OdooRequest:
     createOn: Optional[str] = None
     resolutionDate: Optional[str] = None
     closedOn: Optional[str] = None
+    # by-id (/dpgr/id) extra fields. dpComment/escalatedComment/escalatedDate/
+    # closingComment/withdrawalComment are free-text + close/escalation; iPAddress/
+    # deviceType are DPDP request-proof. attachment/consent/dataDiscovery/
+    # trackAssigneeStatus/vendor_activity have no create-path target and are
+    # intentionally dropped (see issue_report).
+    dpComment: Optional[str] = None
+    escalatedComment: Optional[str] = None
+    escalatedDate: Optional[str] = None
+    closingComment: Optional[str] = None
+    withdrawalComment: Optional[str] = None
+    iPAddress: Optional[str] = None
+    deviceType: Optional[str] = None
 
 
 @dataclass
@@ -44,8 +56,10 @@ class FlaskRequestPayload:
     name: str
     email: str
     phone: str
-    request_type: int             
+    request_type: int
     processing_activity_names: List[str] = field(default_factory=list)
+    # Odoo consent ids to withdraw (revoke requests); backend resolves via source-map.
+    consent_source_ids: List[int] = field(default_factory=list)
     assigned_user_names: List[str] = field(default_factory=list)
     status: str = "Initiated"
     rag_status: str = "Green"
@@ -56,4 +70,12 @@ class FlaskRequestPayload:
     created_on: Optional[str] = None
     resolution_date: Optional[str] = None
     closed_on: Optional[str] = None
+    # Flask target columns: dp_comment / escalated_comment / escalated_date /
+    # closed_comment / ip_address / device_type. is_escalated is derived backend-side.
+    dp_comment: Optional[str] = None
+    escalated_comment: Optional[str] = None
+    escalated_date: Optional[str] = None
+    closed_comment: Optional[str] = None
+    ip_address: Optional[str] = None
+    device_type: Optional[str] = None
 
