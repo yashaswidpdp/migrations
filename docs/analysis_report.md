@@ -51,10 +51,10 @@ The suggestion says "find out what domain is registered" and leaves it open. Tha
 
 ```
 id=2  skfinance.localhost.com   ← owns ALL 16 processing activities in Flask
-id=3  dodpconsultants.com       ← zero processing activities (empty tenant)
+id=3  skfinance.localhost.com       ← zero processing activities (empty tenant)
 ```
 
-The Odoo source URL is `tool.dpdp-portal.dpdpconsultants.com`, which maps conceptually to `dodpconsultants.com` in Flask. But that tenant has **no processing activities at all** in Flask. This is a data readiness problem — the PAs for that tenant haven't been loaded yet.
+The Odoo source URL is `tool.dpdp-portal.dpdpconsultants.com`, which maps conceptually to `skfinance.localhost.com` in Flask. But that tenant has **no processing activities at all** in Flask. This is a data readiness problem — the PAs for that tenant haven't been loaded yet.
 
 The only tenant with PAs is `skfinance.localhost.com`. But those PAs (`HR`, `Events`, `Sale`, `Loan`, `Deposit`, etc.) belong to a completely different client.
 
@@ -107,7 +107,7 @@ Inserting a `localhost` tenant is data corruption. Any consent created under tha
 |---|---------|-----------|--------------------------|
 | 1 | No `Host` header → tenant resolution fails | Yes, immediate | Yes ✓ |
 | 2 | PA names in CSV don't exist in Flask for any tenant | Yes, data integrity | No ✗ |
-| 3 | `dodpconsultants.com` tenant has zero PAs loaded | Yes, pre-condition | No ✗ |
+| 3 | `skfinance.localhost.com` tenant has zero PAs loaded | Yes, pre-condition | No ✗ |
 | 4 | `FLASK_API_KEY` is a placeholder | Yes, auth will fail next | No ✗ |
 
 ---
@@ -116,16 +116,16 @@ Inserting a `localhost` tenant is data corruption. Any consent created under tha
 
 **Step 1 — Decide which Flask tenant owns this Odoo data.**
 
-The Odoo source is `dpdpconsultants.com`. The Flask tenant `dodpconsultants.com` (id=3) is the logical owner. Use that as your Host domain.
+The Odoo source is `dpdpconsultants.com`. The Flask tenant `skfinance.localhost.com` (id=3) is the logical owner. Use that as your Host domain.
 
 **Step 2 — Migrate the Odoo Processing Activities into Flask first.**
 
-The 363 consent records reference PAs that don't exist in Flask. Consents can't be meaningfully linked without the PAs existing first. There should be a PA extraction/load step in this pipeline. Run that first for the `dodpconsultants.com` tenant.
+The 363 consent records reference PAs that don't exist in Flask. Consents can't be meaningfully linked without the PAs existing first. There should be a PA extraction/load step in this pipeline. Run that first for the `skfinance.localhost.com` tenant.
 
 **Step 3 — Set real values in `config/.env`.**
 
 ```
-FLASK_TENANT_DOMAIN=dodpconsultants.com
+FLASK_TENANT_DOMAIN=skfinance.localhost.com
 FLASK_API_KEY=<real key from Flask admin panel>
 ```
 
@@ -143,7 +143,7 @@ Apply this to `self.headers` used in `load_live_via_live_consent`, `load_deemed_
 
 **Step 5 — Re-run the consent load.**
 
-After PAs exist in Flask under `dodpconsultants.com` and the Host header is set, `_resolve_pa_ids()` will return the right map and consents will land with proper PA associations.
+After PAs exist in Flask under `skfinance.localhost.com` and the Host header is set, `_resolve_pa_ids()` will return the right map and consents will land with proper PA associations.
 
 ---
 
