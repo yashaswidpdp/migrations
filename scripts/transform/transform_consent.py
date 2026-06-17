@@ -128,6 +128,9 @@ def transform_consent_data(input_filename: str, output_filename: str):
                 "processing_activity_name": processing_activity_name,
                 "manager_name": manager_name,
                 "status": map_status(row.get("status")),
+                # Flask stores status + consent_lifecycle separately; the Odoo
+                # source has one `status` value that seeds both.
+                "consent_lifecycle": map_status(row.get("status")),
                 "legacyType": map_legacy_type(row.get("legacyType", "legacy")),
                 "consentType": map_consent_type(row.get("paperType", "digital")),
                 "processingType": map_processing_type(row.get("userActivityType", "mandatory")),
@@ -138,6 +141,18 @@ def transform_consent_data(input_filename: str, output_filename: str):
                 "delivered_on": format_consent_date(row.get("deliveredOn")),
                 "valid_till": format_consent_date(row.get("validTill")),
                 "consent_reject_on": format_consent_date(row.get("consentRejectOn")),
+                # Audit timestamps -> created_at / last_updated / closed_on.
+                "created_on": format_consent_date(row.get("createdOn")),
+                "last_updated": format_consent_date(row.get("lastUpdatedOn")),
+                "closed_on": format_consent_date(row.get("closedOn")),
+                # Consent-proof + traceability fields (DPDP evidence). Carry
+                # artifact verbatim - same {nameId}_{ts}_{PA}_{?}_{tmpl} format
+                # as Flask; regenerating would break traceability.
+                "artifact": str(row.get("artifactId", "") or ""),
+                "ip_address": str(row.get("iPAddress", "") or ""),
+                "device_type": str(row.get("deviceType", "") or ""),
+                # Links consent to a DPGR request (Flask `request_no`).
+                "request_no": str(row.get("dpgrRequestNo", "") or ""),
                 "accept_terms": True,
             }
 
