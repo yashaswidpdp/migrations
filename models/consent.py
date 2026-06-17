@@ -49,11 +49,22 @@ class OdooConsent:
     userActivityType: str
     paperType: str
     legacyType: str
-    pAManager: object 
+    pAManager: object
     consentRejectOn: Optional[str] = None
     validTill: Optional[str] = None
     sentOn: Optional[str] = None
     deliveredOn: Optional[str] = None
+    # by-id (/dpcm/id) extra fields. createdOn/lastUpdatedOn/closedOn are audit
+    # timestamps; artifactId/iPAddress/deviceType are DPDP consent-proof;
+    # dpgrRequestNo links to a DPGR request. emailStatus/templateBody/
+    # dataDiscovery have no Flask column and are intentionally dropped.
+    createdOn: Optional[str] = None
+    lastUpdatedOn: Optional[str] = None
+    closedOn: Optional[str] = None
+    artifactId: Optional[str] = None
+    iPAddress: Optional[str] = None
+    deviceType: Optional[str] = None
+    dpgrRequestNo: Optional[str] = None
 
 @dataclass
 class FlaskConsentPayload:
@@ -75,4 +86,16 @@ class FlaskConsentPayload:
     valid_till: Optional[str] = None
     sent_on: Optional[str] = None
     delivered_on: Optional[str] = None
+    # Flask target columns: created_at / last_updated / closed_on.
+    created_on: Optional[str] = None
+    last_updated: Optional[str] = None
+    closed_on: Optional[str] = None
+    # Flask `consent_lifecycle` (seeded from Odoo `status`).
+    consent_lifecycle: Optional[str] = None
+    # Consent-proof + traceability (Flask: artifact / ip_address / device_type).
+    artifact: Optional[str] = None
+    ip_address: Optional[str] = None
+    device_type: Optional[str] = None
+    # Flask `request_no` (DPGR request link).
+    request_no: Optional[str] = None
 
