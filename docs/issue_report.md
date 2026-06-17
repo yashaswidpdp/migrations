@@ -635,6 +635,38 @@ See `docs/backend_changes.md` — the canonical ledger of all migration-required
 
 ---
 
+## Issue 27 — Revoke consent link requires consent-before-request ordering
+
+### Symptom
+`/migration/request` returns `unlinked_consent_source_ids` non-empty; a revoked
+consent never gets `request_id`/`is_revoke` set, so completing the request does
+not withdraw the consent.
+
+### Root Cause
+Revoke requests (`requestType` = "Right to withdraw consent" / "Legacy consent
+revoke request") carry the consent(s) to withdraw in the Odoo `consent[]` array.
+The transform emits those Odoo consent ids as `consent_source_ids`; the backend
+resolves them to Flask consent ids via `MigrationSourceMap("consent", …)` and
+links them. Resolution only succeeds if the consent was migrated first.
+
+### Ordering requirement (enforced-soft)
+Consents must migrate before requests, else revoke links land in
+`unlinked_consent_source_ids`. Pipelines are separate CLI groups (no master
+ordering). Run `consent run_all` then `request run_all`. Re-running requests
+after consents exist would re-link — but source-map 409 blocks request
+re-migration. So if a consent isn't migrated when its revoke request loads, the
+link is permanently lost unless you clear the request source-map row and re-run.
+
+Full safe order (each step feeds ids the next needs):
+`stakeholder` → `processing_activity` → `vendor` → `consent` → `request`.
+
+### Fix Location
+`transform_request.py` (emit `consent_source_ids`), `extract_odoo.py` (carry
+`consent` json), `migration_ext/routes.py` (`migrate_request` resolve + link,
+report `unlinked_consent_source_ids`).
+
+---
+
 ## Summary Table
 
 | # | Issue | Severity | Status | Fix Location |
@@ -665,3 +697,5 @@ See `docs/backend_changes.md` — the canonical ledger of all migration-required
 | 24 | 12 phone-only request records have no email | Medium | Fixed | `load_flask.py` |
 | 25 | Request loading not idempotent — duplicates on re-run | High | Fixed | `models/request.py`, `routes/request_routes.py`, DB direct SQL |
 | 26 | All backend patches overwritten after `git pull` | Critical | Fixed | All 4 backend files (see Issue 26 body above) |
+| 27 | Revoke consent link needs consent-before-request order | Medium | Documented + handled | `transform_request.py`, `extract_odoo.py`, `migration_ext/routes.py` |
+| 28 | Request extra dates tz-aware vs naive `raised_on` | Medium | Fixed | `migration_ext/routes.py` (`_naive_utc`) |
