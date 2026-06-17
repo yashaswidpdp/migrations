@@ -49,7 +49,8 @@ class FlaskLoader:
         error_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
 
         pa_map = self._resolve_pa_ids()
-        request_type_id = self._resolve_request_type_id()
+        default_request_type_id = self._resolve_request_type_id()
+        request_type_map = self._resolve_request_type_map()
 
         for index, row in df.iterrows():
             record_data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
@@ -66,8 +67,21 @@ class FlaskLoader:
                 except Exception:
                     pass
 
-            if request_type_id:
-                record_data["request_type_id"] = request_type_id
+            # Resolve request type per record from the enriched name (from
+            # /dpgr/id `requestType [id, name]`); fall back to the tenant default.
+            rt_name = record_data.get("request_type_name")
+            resolved_rt_id = None
+            if rt_name:
+                resolved_rt_id = request_type_map.get(str(rt_name).strip().lower())
+                if resolved_rt_id is None:
+                    logger.warning(
+                        f"Request type '{rt_name}' not found in Flask request_types; "
+                        f"falling back to default id={default_request_type_id}."
+                    )
+            final_rt_id = resolved_rt_id or default_request_type_id
+            if final_rt_id:
+                record_data["request_type_id"] = final_rt_id
+            record_data.pop("request_type_name", None)
 
             # assigned_users comes from the transform as a string repr of an ID
             # list (e.g. "[5]"); parse it back to a real list so the backend's
@@ -135,6 +149,76 @@ class FlaskLoader:
         except Exception as e:
             logger.warning(f"Could not fetch request types from Flask API: {e}")
         return None
+
+    def _resolve_request_type_map(self) -> dict:
+        """Map every Flask request type name (lower-cased) -> id, so an enriched
+        Odoo `requestType` name resolves to the right id instead of a hardcoded
+        default. Mirrors the PA / template name->id resolution."""
+        name_to_id = {}
+        try:
+            response = requests.get(
+                f"{self.base_url}/request-types/",
+                headers=self.headers,
+                timeout=30,
+            )
+            if response.status_code == 200:
+                body = response.json()
+                data = body.get("data", {})
+                records = data.get("records", []) if isinstance(data, dict) else data
+                if isinstance(records, list):
+                    for r in records:
+                        if isinstance(r, dict) and "name" in r and "id" in r:
+                            name_to_id[str(r["name"]).strip().lower()] = r["id"]
+        except Exception as e:
+            logger.warning(f"Could not build request-type name map: {e}")
+        return name_to_id
+
+    def seed_request_types(self, seed_file: str = "request_types_seed.json"):
+        """Create the Flask request_types that the migrated Odoo requests refer
+        to. Idempotent: skips any name already present. Must run before the
+        request load, otherwise `request_type_name` can't resolve to an id.
+
+        Note: the backend allows only ONE request type with is_revoke=True per
+        tenant — the seed file reflects that (only the revoke type sets it)."""
+        import json
+        path = seed_file
+        if not os.path.isabs(path) and not os.path.exists(path):
+            path = os.path.join(os.getenv("DATA_DIR", "data"), seed_file)
+        if not os.path.exists(path):
+            logger.error(f"Request-type seed file not found: {path}")
+            return
+        with open(path, encoding="utf-8") as f:
+            payloads = json.load(f)
+
+        existing = self._resolve_request_type_map()  # name(lower) -> id
+        created = skipped = failed = 0
+        for p in payloads:
+            name = str(p.get("name", "")).strip()
+            if not name:
+                continue
+            if name.lower() in existing:
+                logger.info(f"Request type '{name}' already exists (id={existing[name.lower()]}). Skipping.")
+                skipped += 1
+                continue
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/request-types/create",
+                    headers=self.headers,
+                    json=p,
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    logger.info(f"Created request type '{name}'.")
+                    created += 1
+                elif resp.status_code == 400 and "already exists" in resp.text:
+                    skipped += 1
+                else:
+                    logger.error(f"Failed to create request type '{name}': {resp.status_code} - {resp.text}")
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception creating request type '{name}': {e}")
+                failed += 1
+        logger.info(f"Request-type seed summary: {created} created, {skipped} skipped, {failed} failed.")
 
     def _resolve_user_ids(self) -> dict:
         """Fetch all backend users from Flask and map their names to user IDs."""
@@ -952,6 +1036,10 @@ class FlaskLoader:
 
 def run_loading(csv_filename: str, endpoint: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_from_csv(csv_filename, endpoint)
+
+
+def run_request_type_seeding(seed_file: str = "request_types_seed.json"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).seed_request_types(seed_file)
 
 
 def run_legacy_loading(csv_filename: str):
