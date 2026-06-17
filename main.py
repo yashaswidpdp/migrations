@@ -7,6 +7,7 @@ from scripts.extract.extract_odoo import (
     run_extraction,
     run_pa_extraction,
     run_template_extraction,
+    run_vendor_extraction,
     run_request_enrichment,
     run_consent_enrichment,
 )
@@ -14,6 +15,7 @@ from scripts.transform.transform_consent import transform_consent_data
 from scripts.transform.transform_request import transform_request_data
 from scripts.transform.transform_processing_activity import transform_processing_activity_data
 from scripts.transform.transform_template import transform_template_data
+from scripts.transform.transform_vendor import transform_vendor_data
 from scripts.load.load_flask import (
     run_loading,
     run_request_type_seeding,
@@ -25,6 +27,7 @@ from scripts.load.load_flask import (
     run_template_loading,
     run_template_approval,
     run_template_load_and_approve,
+    run_vendor_loading,
 )
 
 # Setup logging
@@ -398,6 +401,66 @@ def run_all():
         click.echo("Full template pipeline completed.")
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+# ==========================================
+# VENDOR COMMANDS
+# ==========================================
+@cli.group()
+def vendor():
+    """Commands for migrating Vendors (/api/vendors_details)"""
+    pass
+
+
+@vendor.command()
+def extract():
+    """Stage 1: Extract vendors from Odoo to data/raw/"""
+    logger.info("Extracting vendors...")
+    try:
+        run_vendor_extraction("raw_vendors.json")
+        click.echo("Extracted to data/raw/raw_vendors.json")
+    except Exception as e:
+        logger.error(f"Vendor extraction failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@vendor.command()
+def transform():
+    """Stage 1.5: Transform vendors to Flask format"""
+    try:
+        transform_vendor_data("raw_vendors.json", "processed_vendors.csv")
+        click.echo("Transformation complete. Check data/processed/processed_vendors.csv")
+    except Exception as e:
+        logger.error(f"Vendor transform failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@vendor.command()
+def load():
+    """Stage 2: Load vendors into Flask API"""
+    try:
+        run_vendor_loading("processed_vendors.csv")
+        click.echo("Vendor loading complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Vendor load failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@vendor.command(name="run-all")
+def vendor_run_all():
+    """Run full pipeline: Extract → Transform → Load"""
+    logger.info("Starting full vendor migration pipeline")
+    try:
+        click.echo("Stage 1: Extracting...")
+        run_vendor_extraction("raw_vendors.json")
+        click.echo("Stage 1.5: Transforming...")
+        transform_vendor_data("raw_vendors.json", "processed_vendors.csv")
+        click.echo("Stage 2: Loading...")
+        run_vendor_loading("processed_vendors.csv")
+        click.echo("Full vendor migration completed.")
+    except Exception as e:
+        logger.error(f"Vendor pipeline failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 
