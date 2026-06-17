@@ -1,11 +1,14 @@
 import click
 import logging
 import os
+import sys
 from dotenv import load_dotenv
 from scripts.extract.extract_odoo import (
     run_extraction,
     run_pa_extraction,
     run_template_extraction,
+    run_request_enrichment,
+    run_consent_enrichment,
 )
 from scripts.transform.transform_consent import transform_consent_data
 from scripts.transform.transform_request import transform_request_data
@@ -13,6 +16,7 @@ from scripts.transform.transform_processing_activity import transform_processing
 from scripts.transform.transform_template import transform_template_data
 from scripts.load.load_flask import (
     run_loading,
+    run_request_type_seeding,
     run_legacy_loading,
     run_paper_loading,
     run_consent_migration_loading,
@@ -29,16 +33,26 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("logs/migration.log"),
+        # mode="a" => append; log persists across runs until file is deleted
+        logging.FileHandler("logs/migration.log", mode="a"),
         logging.StreamHandler()
-    ]
+    ],
+    # force=True => override any basicConfig already set by imported modules,
+    # otherwise the FileHandler silently never attaches and the file stays empty
+    force=True,
 )
 logger = logging.getLogger("migration")
 
 @click.group()
-def cli():
+@click.pass_context
+def cli(ctx):
     """Odoo to Flask Migration Orchestrator"""
     load_dotenv("config/.env")
+    # Timestamped banner per command run; appended to logs/migration.log
+    command = " ".join(sys.argv[1:]) or "<no command>"
+    logger.info("=" * 60)
+    logger.info("COMMAND RUN: %s", command)
+    logger.info("=" * 60)
 
 # ==========================================
 # CONSENT COMMANDS
@@ -57,6 +71,17 @@ def extract():
         click.echo("Successfully extracted data to data/raw/raw_consents.csv")
     except Exception as e:
         logger.error(f"Extraction failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+@consent.command()
+def enrich():
+    """Stage 1.2: Backfill type fields per record via GET /dpcm/id?id=<N>"""
+    logger.info("Starting consent enrichment via /dpcm/id...")
+    try:
+        run_consent_enrichment("raw_consents.csv")
+        click.echo("Consent enrichment complete (userActivityType/type fields backfilled).")
+    except Exception as e:
+        logger.error(f"Enrichment failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 @consent.command()
@@ -89,7 +114,10 @@ def run_all():
     try:
         click.echo("Stage 1: Extracting...")
         run_extraction("/dpcm/dashboard", "raw_consents.csv")
-        
+
+        click.echo("Stage 1.2: Enriching type fields via /dpcm/id...")
+        run_consent_enrichment("raw_consents.csv")
+
         click.echo("Stage 1.5: Transforming...")
         transform_consent_data("raw_consents.csv", "processed_consents.csv")
 
@@ -121,6 +149,17 @@ def extract():
         click.echo(f"Error: {e}", err=True)
 
 @request.command()
+def enrich():
+    """Stage 1.2: Add requestType + assignee email per record via GET /dpgr/id?id=<N>"""
+    logger.info("Starting request enrichment via /dpgr/id...")
+    try:
+        run_request_enrichment("raw_requests.csv")
+        click.echo("Request enrichment complete (requestType + assignee_email added).")
+    except Exception as e:
+        logger.error(f"Enrichment failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+@request.command()
 @click.option("--user-id", "user_id", type=int, default=None, help="Flask user_id to set as assigned_users on every request")
 def transform(user_id):
     """Stage 1.5: Transform data to Flask format"""
@@ -130,6 +169,17 @@ def transform(user_id):
         click.echo("Transformation complete. Check data/processed/processed_requests.csv")
     except Exception as e:
         logger.error(f"Transformation failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+@request.command()
+def seed_types():
+    """Stage 1.8: Seed Flask request_types the migrated requests refer to (idempotent)"""
+    logger.info("Seeding request types from data/request_types_seed.json...")
+    try:
+        run_request_type_seeding("request_types_seed.json")
+        click.echo("Request-type seeding complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Seeding failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 @request.command()
@@ -152,9 +202,15 @@ def run_all(user_id):
         click.echo("Stage 1: Extracting...")
         run_extraction("/dpgr/dashboard", "raw_requests.csv")
 
+        click.echo("Stage 1.2: Enriching requestType via /dpgr/id...")
+        run_request_enrichment("raw_requests.csv")
+
         click.echo("Stage 1.5: Transforming...")
         transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
-        
+
+        click.echo("Stage 1.8: Seeding request types (idempotent)...")
+        run_request_type_seeding("request_types_seed.json")
+
         click.echo("Stage 2: Loading...")
         run_loading("processed_requests.csv", "/migration/request")
         
