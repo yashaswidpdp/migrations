@@ -4,6 +4,8 @@ import os
 import sys
 import logging
 import ast
+import base64
+import json
 from io import BytesIO
 from dotenv import load_dotenv
 import openpyxl
@@ -93,7 +95,13 @@ class FlaskLoader:
                 except Exception:
                     record_data.pop("assigned_users", None)
 
-            if not record_data.get("phone"):
+            # Only synthesize a placeholder phone when there is NO email to key
+            # on. Injecting a shared dummy phone for email-bearing rows makes
+            # every such request collide on that one phone (email=X but
+            # phone=<dummy owned by the first row>) -> identity-conflict 409.
+            # Email rows must stay phone-less so they resolve by email to the
+            # principal the consent migration already created.
+            if not record_data.get("phone") and not record_data.get("email"):
                 record_data["phone"] = "0000000000"
 
             if not record_data.get("email"):
@@ -113,11 +121,34 @@ class FlaskLoader:
                     timeout=30,
                 )
 
+                # Identity-conflict retry: a 409 mentioning "Data Principal"
+                # means the carried phone resolves to a DIFFERENT principal than
+                # the email (shared dummy numbers in the source). Re-key by email
+                # alone so the request still attaches to the right person. A 409
+                # WITHOUT that phrase is the idempotent "already migrated" case.
+                if (
+                    response.status_code == 409
+                    and record_data.get("phone")
+                    and "data principal" in response.text.lower()
+                ):
+                    retry = {k: v for k, v in record_data.items() if k != "phone"}
+                    logger.warning(
+                        f"Record {index + 1}: phone collided with another principal; "
+                        f"retrying email-only."
+                    )
+                    response = requests.post(
+                        f"{self.base_url}{endpoint}",
+                        headers=self.headers,
+                        json=retry,
+                        timeout=30,
+                    )
+
                 if response.status_code in [200, 201]:
                     logger.info(f"Loaded record {index + 1}/{len(df)}")
                     success_count += 1
-                elif response.status_code == 409:
-                    logger.info(f"Record {index + 1} already exists. Skipping.")
+                elif response.status_code == 409 and "data principal" not in response.text.lower():
+                    # Genuinely already migrated (source-map hit) — idempotent skip.
+                    logger.info(f"Record {index + 1} already migrated. Skipping.")
                     success_count += 1
                 else:
                     logger.error(f"Failed record {index + 1}: {response.status_code} - {response.text}")
@@ -132,6 +163,124 @@ class FlaskLoader:
             logger.error(f"{len(failure_rows)} failures written to {error_file}")
 
         logger.info(f"Summary: {success_count} succeeded, {len(failure_rows)} failed.")
+
+    def load_vendors(self, csv_filename: str = "processed_vendors.csv"):
+        """Migrate vendors to /migration/vendor. Resolves Odoo department names
+        -> Flask PA ids; idempotent via the source-map (a 409 that is NOT an
+        identity conflict = 'already migrated' -> skip). On an identity conflict
+        (vendor email/phone resolves to a different principal) retry email-only
+        so the vendor still lands."""
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"Vendor CSV not found: {input_path}")
+            return
+        df = pd.read_csv(input_path)
+        logger.info(f"Loaded {len(df)} vendor records from {csv_filename}")
+
+        pa_map = self._resolve_pa_ids()
+        attach_manifest = self._load_vendor_attachment_manifest()
+        endpoint = f"{self.base_url}/migration/vendor"
+        created = skipped = failed = 0
+        failure_rows = []
+
+        for index, row in df.iterrows():
+            data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
+
+            # Attach decoded documents (sidecar files) back as inline Base64 so
+            # the migration endpoint can store them via the real upload service.
+            attachments = self._build_attachments(attach_manifest, data.get("odoo_source_id"))
+            if attachments:
+                data["attachments"] = attachments
+
+            # Odoo department names -> Flask processing-activity ids.
+            names = data.pop("processing_activity_names", None)
+            pa_ids = []
+            if names:
+                try:
+                    for n in ast.literal_eval(str(names)):
+                        pid = pa_map.get(str(n).strip())
+                        if pid:
+                            pa_ids.append(pid)
+                except Exception:
+                    pass
+            data["processing_activity_ids"] = pa_ids
+
+            # Empty risk -> None so the endpoint stores NULL (no assessed risk).
+            if not data.get("risk_level"):
+                data["risk_level"] = None
+
+            try:
+                resp = requests.post(endpoint, headers=self.headers, json=data, timeout=30)
+                if resp.status_code == 409 and data.get("phone") and "data principal" in resp.text.lower():
+                    retry = {k: v for k, v in data.items() if k != "phone"}
+                    logger.warning(f"Vendor row {index + 1}: phone collided with another principal; retrying email-only.")
+                    resp = requests.post(endpoint, headers=self.headers, json=retry, timeout=30)
+
+                if resp.status_code in (200, 201):
+                    body = resp.json().get("data", {})
+                    logger.info(f"Created vendor '{data.get('company_name')}' (id={body.get('id')}, vendor_id={body.get('vendor_id')}).")
+                    created += 1
+                elif resp.status_code == 409 and "already migrated" in resp.text.lower():
+                    # True idempotent skip — the source-map already has this vendor.
+                    logger.info(f"Vendor '{data.get('company_name')}' already migrated. Skipping.")
+                    skipped += 1
+                else:
+                    # Real failure — incl. "Vendor already exists for user"
+                    # (a different Odoo vendor sharing this contact user). Surface
+                    # it, never silently count as success.
+                    logger.error(f"Failed vendor '{data.get('company_name')}': {resp.status_code} - {resp.text[:300]}")
+                    failure_rows.append({**data, "error_message": resp.text, "status_code": resp.status_code})
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception loading vendor row {index + 1}: {e}")
+                failure_rows.append({**data, "error_message": str(e)})
+                failed += 1
+
+        if failure_rows:
+            err = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
+            pd.DataFrame(failure_rows).to_csv(err, index=False)
+            logger.error(f"{len(failure_rows)} vendor failures written to {err}")
+        logger.info(f"Vendor load complete: {created} created, {skipped} skipped, {failed} failed.")
+
+    def _load_vendor_attachment_manifest(self) -> dict:
+        """Read the transform's vendor attachment manifest (keyed by Odoo id).
+        Missing manifest => no attachments (older runs / list-only extracts)."""
+        path = os.path.join(DATA_PROCESSED_DIR, "vendor_attachments_manifest.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read vendor attachment manifest {path}: {e}")
+            return {}
+
+    def _build_attachments(self, manifest: dict, odoo_source_id) -> dict:
+        """Re-encode this vendor's sidecar files into the inline-Base64 payload
+        the /migration/vendor endpoint expects:
+
+            {field: {"fileName": <name>, "fileContent": <base64>}}
+
+        A sidecar referenced by the manifest but missing on disk is skipped with
+        a warning (never fatal — the vendor still migrates without that doc)."""
+        if not manifest or odoo_source_id is None:
+            return {}
+        entry = manifest.get(str(odoo_source_id)) or manifest.get(odoo_source_id)
+        if not isinstance(entry, dict):
+            return {}
+        out = {}
+        for field, meta in entry.items():
+            if not isinstance(meta, dict):
+                continue
+            sidecar = meta.get("path")
+            if not sidecar or not os.path.exists(sidecar):
+                logger.warning(f"Vendor {odoo_source_id} {field}: sidecar missing ({sidecar}); skipping.")
+                continue
+            with open(sidecar, "rb") as f:
+                content = base64.b64encode(f.read()).decode("ascii")
+            out[field] = {"fileName": meta.get("fileName") or os.path.basename(sidecar),
+                          "fileContent": content}
+        return out
 
     def _resolve_request_type_id(self) -> int | None:
         try:
@@ -1076,6 +1225,10 @@ def run_template_load_and_approve(csv_filename: str):
     loader = FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY)
     created_ids = loader.load_templates(csv_filename)
     loader.approve_templates(csv_filename, id_map=created_ids)
+
+
+def run_vendor_loading(csv_filename: str = "processed_vendors.csv"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_vendors(csv_filename)
 
 
 if __name__ == "__main__":
