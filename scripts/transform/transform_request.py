@@ -40,6 +40,20 @@ def parse_dict_list_string(list_str) -> list:
         return []
 
 
+def parse_request_type_name(raw) -> str:
+    """Odoo `requestType` arrives as `[id, "Name"]` (from /dpgr/id enrichment).
+    Return the name so the loader can resolve it to a Flask request_types.id.
+    Empty string when absent — loader then falls back to the default type."""
+    if isinstance(raw, (list, tuple)):
+        return str(raw[1]).strip() if len(raw) >= 2 else ""
+    if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("["):
+        return raw.strip()
+    val = parse_tuple_string(raw)
+    if isinstance(val, (list, tuple)) and len(val) >= 2:
+        return str(val[1]).strip()
+    return ""
+
+
 def map_request_status(odoo_status: str) -> str:
     status_map = {
         "Not Assigned": "Initiated",
@@ -94,6 +108,16 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 if isinstance(item, dict) and "name" in item
             ]
 
+            # Revoke requests carry the consent(s) to withdraw. Emit the Odoo
+            # consent ids; the backend resolves them to Flask consent ids via the
+            # migration source-map (consents must be migrated first) and links
+            # them to the request so completion withdraws them.
+            consent_raw = parse_dict_list_string(row.get("consent"))
+            consent_source_ids = [
+                item.get("id") for item in consent_raw
+                if isinstance(item, dict) and item.get("id")
+            ]
+
             # Assignee is a Flask user_id supplied at transform time (the same
             # backend user runs the migration / owns these requests). Emitted as
             # an ID list so the loader can pass it straight to /request/create's
@@ -107,8 +131,13 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 "phone": str(row.get("phone", "")).strip(),
                 # Odoo requestNo -> Flask request_no, carried through verbatim.
                 "request_no": str(row.get("requestNo", "")).strip(),
-                "request_type_id": map_request_status(row.get("request_type")),
+                # Odoo `requestType [id, name]` from /dpgr/id enrichment. Emit the
+                # NAME; the loader resolves it to a Flask request_types.id (and
+                # falls back to the default type when blank). Replaces the old
+                # bug that fed a status mapper into request_type_id.
+                "request_type_name": parse_request_type_name(row.get("requestType")),
                 "processing_activity_names": processing_activity_names,
+                "consent_source_ids": consent_source_ids,
                 "assigned_users": assigned_users,
                 "status": map_request_status(row.get("status", "Not Assigned")),
                 "rag_status": map_rag_status(row.get("ragStatus", "Green")),
@@ -120,6 +149,22 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 "action_date": to_iso_datetime(row.get("actionDate")),
                 "resolution_date": to_iso_datetime(row.get("resolutionDate")),
                 "closed_on": to_iso_datetime(row.get("closedOn")),
+                # Free-text + escalation + close fields -> Flask Request columns
+                # (dp_comment / escalated_comment / escalated_date / closed_comment).
+                # closingComment and withdrawalComment both describe the close;
+                # prefer closingComment, fall back to withdrawalComment.
+                "dp_comment": str(row.get("dpComment", "") or "").strip(),
+                "escalated_comment": str(row.get("escalatedComment", "") or "").strip(),
+                "escalated_date": to_iso_datetime(row.get("escalatedDate")),
+                "closed_comment": (
+                    str(row.get("closingComment", "") or "").strip()
+                    or str(row.get("withdrawalComment", "") or "").strip()
+                ),
+                # DPDP request-proof metadata (Flask: ip_address / device_type).
+                # The create path stamps the migration server's IP/device; these
+                # carry the data principal's original capture values instead.
+                "ip_address": str(row.get("iPAddress", "") or "").strip(),
+                "device_type": str(row.get("deviceType", "") or "").strip(),
             }
 
             transformed_records.append(record)
