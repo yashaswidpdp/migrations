@@ -254,6 +254,23 @@ def run_vendor_extraction(output_file: str = "raw_vendors.json"):
     else:
         logger.error("Vendor extraction returned empty response.")
 
+def run_stakeholder_extraction(output_file: str = "raw_stakeholders.json"):
+    """Extract all internal stakeholders from Odoo (GET /stakeholders) and save
+    as JSON. The endpoint returns the full set in one shot (no pagination):
+
+        {"status": "success", "recordType": "Internal Stakeholders",
+         "totalInternalStakeholders": N, "stakeholders": [ {...} ]}
+
+    Saved verbatim so the transform owns all field mapping/role flattening.
+    """
+    extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
+    raw = extractor.fetch_simple("/stakeholders")
+    if raw:
+        extractor.save_to_json(raw, output_file)
+    else:
+        logger.error("Stakeholder extraction returned empty response.")
+
+
 def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     """Enrich the dashboard request CSV with the per-record by-id fields the
     dashboard omits — chiefly `requestType [id, name]`, plus the assignee
