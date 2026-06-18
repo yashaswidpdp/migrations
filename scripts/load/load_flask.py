@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 import openpyxl
 from typing import Optional
 
+from scripts.load.stakeholder_role_mapper import StakeholderRoleMapper
+from scripts.load import stakeholder_report
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../dpdp_python")))
 
 load_dotenv("config/.env")
@@ -211,7 +214,7 @@ class FlaskLoader:
 
             try:
                 resp = requests.post(endpoint, headers=self.headers, json=data, timeout=30)
-                if resp.status_code == 409 and data.get("phone") and "data principal" in resp.text.lower():
+                if resp.status_code == 409 and data.get("phone") and "principal" in resp.text.lower():
                     retry = {k: v for k, v in data.items() if k != "phone"}
                     logger.warning(f"Vendor row {index + 1}: phone collided with another principal; retrying email-only.")
                     resp = requests.post(endpoint, headers=self.headers, json=retry, timeout=30)
@@ -1122,6 +1125,98 @@ class FlaskLoader:
 
         logger.info(f"Paper import complete: {total_success} submitted, {total_failure} failed.")
 
+    # ------------------------------------------------------------------ #
+    #  INTERNAL STAKEHOLDER LOADING                                        #
+    # ------------------------------------------------------------------ #
+
+    def load_stakeholders(self, csv_filename: str = "processed_stakeholders.csv"):
+        """Migrate internal stakeholders via the email-free migration endpoint
+        POST /migration/stakeholder.
+
+        That endpoint (migration_ext) creates a Backend PAManager user with NO
+        outbound communication — no welcome/credential email, no SMTP, no OTP,
+        no notifications, no background jobs — and is idempotent via the
+        migration source-map. A historical backfill must never email real users.
+
+        Per stakeholder:
+          * validate email (skip+log when missing)
+          * map Odoo role NAMES -> Flask role ids (fail+log on any unmapped role)
+          * POST; 409 "already migrated" is the idempotent skip, an existing
+            user with the same email is reused/mapped (created=false).
+        A single failure never aborts the run — every record produces a report
+        row, and a CSV/JSON summary is written at the end.
+
+        NOTE: like the public route, this endpoint always creates the user
+        Active; Odoo `is_active` is not applied (all source records are active).
+        """
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"Stakeholder CSV not found: {input_path}")
+            return
+
+        df = pd.read_csv(input_path)
+        logger.info(f"Loaded {len(df)} stakeholder records from {csv_filename}")
+
+        mapper = StakeholderRoleMapper(self.base_url, self.headers)
+        endpoint = f"{self.base_url}/migration/stakeholder"
+        results = []
+
+        for index, row in df.iterrows():
+            data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
+            odoo_id = data.get("odoo_source_id")
+            name = str(data.get("name") or "").strip()
+            email = str(data.get("email") or "").strip().lower()
+            phone = str(data.get("phone") or "").strip() or None
+
+            base = {"odoo_source_id": odoo_id, "name": name, "email": email}
+
+            # ---- email required ----
+            if not email:
+                res = {**base, "status": stakeholder_report.FAILED, "reason": "Missing email (Odoo login was false)"}
+                stakeholder_report.log_result(res); results.append(res)
+                continue
+
+            # ---- role name -> Flask id (never carry Odoo ids) ----
+            try:
+                role_names = ast.literal_eval(str(data.get("role_names") or "[]"))
+                if not isinstance(role_names, list):
+                    role_names = []
+            except Exception:
+                role_names = []
+            role_ids, unmapped = mapper.resolve(role_names)
+            if unmapped:
+                res = {**base, "status": stakeholder_report.FAILED,
+                       "reason": f"Role(s) not found in Flask: {', '.join(unmapped)}",
+                       "role_names": role_names}
+                stakeholder_report.log_result(res); results.append(res)
+                continue
+
+            # ---- create via migration endpoint (no email, idempotent) ----
+            payload = {"odoo_source_id": odoo_id, "name": name, "email": email, "role_ids": role_ids}
+            if phone:
+                payload["phone"] = phone
+            try:
+                resp = requests.post(endpoint, headers=self.headers, json=payload, timeout=60)
+                if resp.status_code in (200, 201):
+                    body = resp.json().get("data") or {}
+                    created = body.get("created", True)
+                    res = {**base,
+                           "status": stakeholder_report.CREATED if created else stakeholder_report.UPDATED,
+                           "flask_user_id": body.get("id"), "role_ids": role_ids}
+                elif resp.status_code == 409:
+                    # source-map hit -> already migrated.
+                    res = {**base, "status": stakeholder_report.SKIPPED,
+                           "flask_user_id": (resp.json().get("data") or {}).get("id"),
+                           "reason": "Already migrated (source-map)"}
+                else:
+                    res = {**base, "status": stakeholder_report.FAILED,
+                           "reason": f"Create failed: {resp.status_code} - {resp.text[:200]}"}
+            except Exception as e:
+                res = {**base, "status": stakeholder_report.FAILED, "reason": f"Create exception: {e}"}
+            stakeholder_report.log_result(res); results.append(res)
+
+        stakeholder_report.write_report(results, csv_filename)
+
     def load_consents_via_migration(self, csv_filename: str):
         """Load consents (paper + legacy together) via the migration extension
         endpoint /migration/consent, one JSON record per row.
@@ -1162,23 +1257,41 @@ class FlaskLoader:
                     json=record,
                     timeout=60,
                 )
+                # An identity collision on phone (the consent's principal shares a
+                # phone with a different existing principal) must NOT be swallowed
+                # as "already migrated" — retry email-only so the consent still
+                # attaches, mirroring the vendor loader.
+                if response.status_code == 409 and record.get("phone") and "phone" in response.text.lower():
+                    retry = {k: v for k, v in record.items() if k != "phone"}
+                    logger.warning(f"Consent {index + 1}: phone collided with another principal; retrying email-only.")
+                    response = requests.post(
+                        f"{self.base_url}/migration/consent",
+                        headers=self.headers, json=retry, timeout=60,
+                    )
+
                 if response.status_code in (200, 201):
                     logger.info(f"Loaded consent {index + 1}/{len(df)}")
                     success += 1
-                elif response.status_code == 409:
+                elif response.status_code == 409 and "already migrated" in response.text.lower():
+                    # True idempotent skip — the source-map already has this consent.
                     logger.info(f"Consent {index + 1} already migrated. Skipping.")
                     success += 1
                 else:
+                    # Real failure (incl. unrecoverable 409s, 400s). Never count as ok.
                     logger.error(f"Consent {index + 1} failed: {response.status_code} - {response.text[:300]}")
                     failures.append({**record, "error": response.text, "status_code": response.status_code})
             except Exception as e:
                 logger.exception(f"Exception loading consent {index + 1}: {e}")
                 failures.append({**record, "error": str(e)})
 
+        err_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
         if failures:
-            err_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
             pd.DataFrame(failures).to_csv(err_file, index=False)
             logger.error(f"{len(failures)} consent failures written to {err_file}")
+        elif os.path.exists(err_file):
+            # Clean run: drop the stale errors file so audits don't read old failures.
+            os.remove(err_file)
+            logger.info(f"Cleared stale errors file {err_file} (0 failures this run).")
 
         logger.info(f"Consent migration load complete: {success} ok, {len(failures)} failed.")
 
@@ -1229,6 +1342,10 @@ def run_template_load_and_approve(csv_filename: str):
 
 def run_vendor_loading(csv_filename: str = "processed_vendors.csv"):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_vendors(csv_filename)
+
+
+def run_stakeholder_loading(csv_filename: str = "processed_stakeholders.csv"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_stakeholders(csv_filename)
 
 
 if __name__ == "__main__":
