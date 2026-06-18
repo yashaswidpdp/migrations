@@ -8,6 +8,7 @@ from scripts.extract.extract_odoo import (
     run_pa_extraction,
     run_template_extraction,
     run_vendor_extraction,
+    run_stakeholder_extraction,
     run_request_enrichment,
     run_consent_enrichment,
 )
@@ -16,6 +17,7 @@ from scripts.transform.transform_request import transform_request_data
 from scripts.transform.transform_processing_activity import transform_processing_activity_data
 from scripts.transform.transform_template import transform_template_data
 from scripts.transform.transform_vendor import transform_vendor_data
+from scripts.transform.transform_stakeholder import transform_stakeholder_data
 from scripts.load.load_flask import (
     run_loading,
     run_request_type_seeding,
@@ -28,6 +30,7 @@ from scripts.load.load_flask import (
     run_template_approval,
     run_template_load_and_approve,
     run_vendor_loading,
+    run_stakeholder_loading,
 )
 
 # Setup logging
@@ -462,6 +465,84 @@ def vendor_run_all():
     except Exception as e:
         logger.error(f"Vendor pipeline failed: {e}")
         click.echo(f"Error: {e}", err=True)
+
+
+# ==========================================
+# INTERNAL STAKEHOLDER COMMANDS
+# ==========================================
+@cli.group()
+def stakeholder():
+    """Commands for migrating Internal Stakeholders (/stakeholders -> /stakeholder/create)"""
+    pass
+
+
+@stakeholder.command()
+def extract():
+    """Stage 1: Extract internal stakeholders from Odoo to data/raw/"""
+    logger.info("Extracting internal stakeholders...")
+    try:
+        run_stakeholder_extraction("raw_stakeholders.json")
+        click.echo("Extracted to data/raw/raw_stakeholders.json")
+    except Exception as e:
+        logger.error(f"Stakeholder extraction failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@stakeholder.command()
+def transform():
+    """Stage 1.5: Transform stakeholders to Flask format"""
+    try:
+        transform_stakeholder_data("raw_stakeholders.json", "processed_stakeholders.csv")
+        click.echo("Transformation complete. Check data/processed/processed_stakeholders.csv")
+    except Exception as e:
+        logger.error(f"Stakeholder transform failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@stakeholder.command()
+def load():
+    """Stage 2: Load stakeholders into Flask API (role-name mapped, idempotent by email)"""
+    try:
+        run_stakeholder_loading("processed_stakeholders.csv")
+        click.echo("Stakeholder loading complete. See data/processed/report_processed_stakeholders.* and logs/migration.log.")
+    except Exception as e:
+        logger.error(f"Stakeholder load failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@stakeholder.command(name="run-all")
+def stakeholder_run_all():
+    """Run full pipeline: Extract -> Transform -> Load"""
+    logger.info("Starting full stakeholder migration pipeline")
+    try:
+        click.echo("Stage 1: Extracting...")
+        run_stakeholder_extraction("raw_stakeholders.json")
+        click.echo("Stage 1.5: Transforming...")
+        transform_stakeholder_data("raw_stakeholders.json", "processed_stakeholders.csv")
+        click.echo("Stage 2: Loading...")
+        run_stakeholder_loading("processed_stakeholders.csv")
+        click.echo("Full stakeholder migration completed.")
+    except Exception as e:
+        logger.error(f"Stakeholder pipeline failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@cli.command()
+@click.option("--no-write", is_flag=True, help="Print only; do not write the .txt report file.")
+@click.option("--self-test", "self_test", is_flag=True, help="Run internal consistency checks and exit.")
+def reconcile(no_write, self_test):
+    """Audit Odoo->Flask completeness: per-entity source vs migrated ledger."""
+    from scripts.report.reconcile import run_reconciliation, self_test as _st, REPORT_PATH
+    if self_test:
+        problems = _st()
+        click.echo("SELF-TEST: " + ("PASS" if not problems else "FAIL"))
+        for p in problems:
+            click.echo(f"  - {p}")
+        raise SystemExit(1 if problems else 0)
+    report = run_reconciliation(write=not no_write)
+    click.echo(report)
+    if not no_write:
+        click.echo(f"\n[written] {REPORT_PATH}")
 
 
 if __name__ == "__main__":
