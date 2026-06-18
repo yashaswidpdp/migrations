@@ -238,3 +238,122 @@ extract (inline Base64)
 | `vra_attachment` | `dpa_document` |
 
 Decoding/upload is centralized server-side in `dpdp_python/migration_ext/attachments/` (decoder, validators, mapper, uploader). Files are stored through the backend's existing `upload_file()` service under `uploads/vendors/`, so a migrated document is indistinguishable from one uploaded via the UI (same naming, download routes, and authorization). MIME is detected from the byte signature, falling back to the filename extension.
+
+---
+
+## 📊 Reconciliation Report
+
+Proves *how much* data actually landed (and explains every record that did not),
+instead of eyeballing `logs/migration.log`. Implemented in
+`scripts/report/reconcile.py`; renders `data/processed/reconciliation_report.txt`.
+
+Four count layers per entity:
+
+| layer | read from | meaning |
+| --- | --- | --- |
+| **SOURCE** | `data/raw/*` (or live Odoo with `--live`) | what Odoo gave |
+| **STAGED** | `data/processed/*` | what transform produced |
+| **MIGRATED** | `migration_source_map` (live Postgres) | what actually landed in Flask |
+| **FAILED** | `data/processed/errors_*.csv` | rejected rows + grouped reasons |
+
+`MIGRATED` reads the ledger via `docker exec <pg> psql`. Container/creds are
+overridable with `RECON_PG_CONTAINER` / `RECON_PG_USER` / `RECON_PG_DB`. Every
+external read degrades to `n/a` rather than raising, so the report always renders.
+
+### Commands
+
+```bash
+python main.py reconcile                 # full audit: print AND write the .txt
+python main.py reconcile --no-write      # same audit, print only (no file)
+python main.py reconcile --self-test     # check the tool itself; no DB, no report
+python main.py reconcile --live          # also re-pull live Odoo + verify live Flask
+```
+
+| flag | runs | DB | network | writes file |
+| --- | --- | --- | --- | --- |
+| *(none)* | full audit, print **and** write `.txt` | yes | no | yes |
+| `--no-write` | same audit, **print only** (pipe / CI) | yes | no | no |
+| `--self-test` | **not an audit** — internal consistency checks (ledger identity, % bounds, render non-empty), exits 0/1 | no | no | no |
+| `--live` | audit **+** re-pull Odoo SOURCE **+** confirm each migrated row exists in the live Flask app → **DRIFT** | yes | yes (both APIs) | yes |
+
+Flags combine, e.g. `python main.py reconcile --live --no-write`.
+
+### Live mode (`--live`)
+
+The default audit trusts the `migration_source_map` ledger. `--live` is the only
+mode that hits the network: it re-counts SOURCE from live Odoo and joins each
+ledger `flask_id` against a live Flask `GET` list (`/consent/`, `/vendor/list`,
+`/auth/backend-users`, `/processing/activities/simple`, `/notice-templates/`),
+paging through every record (the list endpoints cap at 100/page). A record the
+ledger claims migrated but the app no longer returns is flagged **DRIFT** (stale
+ledger / row deleted post-load). Failed live reads render `n/a` — never counted
+as success.
+
+`--live` also runs a **field-level value-equality check** across *every* field:
+for each migrated record it joins source (Odoo) ↔ dest (live Flask) via the
+ledger and compares in three passes:
+
+1. **Explicit maps** (`FIELD_MAPS`) for renamed / enum fields (e.g. Odoo
+   `userActivityType` → Flask `processing_type`), with transform-aware
+   normalization (case/spacing/enum aliases, dates, phone digits).
+2. **Auto-pairing** — every remaining scalar field whose normalized name matches
+   on both sides is value-checked generically.
+3. **List fields** (audit logs / `history`, `managers`, attachment arrays) are
+   **length-compared** (e.g. `history[len]: 5 != 3`); element-wise deep diff
+   would need per-entity rules and is not done.
+
+A field is flagged only when *both* sides carry a value (missing source field =
+skipped, not a false mismatch). Crucially, each entity prints a **coverage
+inventory**: total source fields, total dest fields, how many were value-checked,
+and an explicit list of any **unchecked source fields** + **complex/list fields**
+— so nothing is silently ignored. To close a gap, read the unchecked list and add
+a `FIELD_MAPS` rule for that field.
+
+### Entity tracking + template fan-out
+
+All six entities are now source-map tracked. `processing_activity` and
+`template` are recorded via a backend recorder endpoint, **POST
+/migration/source-map**: the loader creates them through the existing native
+routes, then posts the returned id(s) to the ledger. One Odoo template fans out
+to many Flask notice/email rows, each recorded under the same `odoo_source_id`
+with a distinct `sub_key`, so MIGRATED counts **distinct** source ids (not
+emitted rows).
+
+Tokens are read from `config/.env` (the same gitignored file the loaders use),
+auto-loaded at import — nothing is exported to the global shell or hardcoded:
+
+```ini
+ODOO_JWT_TOKEN=<source Bearer>              # live Odoo (SOURCE)
+FLASK_API_BASE_URL=http://localhost:<port> # dest container
+FLASK_API_KEY=<dest Bearer>                # live Flask (MIGRATED)
+FLASK_TENANT_DOMAIN=<tenant host>          # optional: only if dest needs a Host header
+```
+
+### Verdicts
+
+```
++ PASS         migrated == source
++ PASS*        shortfall fully covered by accepted-loss
+~ RECOVERABLE  remaining failures are operational (license/quota) → re-runnable
+x GAP          records vanished unexplained → investigate
+! DRIFT        ledger says landed, live app disagrees (--live only)
+? UNTRACKED    no source-map ledger yet (processing_activity, template)
+? UNKNOWN      a count could not be read
+```
+
+`data/accepted_loss.json` is the operator-maintained registry of records
+intentionally not migrated; they offset the shortfall as **PASS\***.
+
+> [!NOTE]
+> A freshly-migrated `processing_activity` / `template` only leaves **UNTRACKED**
+> once a load has run with the recorder wiring (it backfills the ledger for
+> existing rows too). Re-run the load if their MIGRATED still reads `n/a`.
+
+### Tests
+
+```bash
+venv/bin/python -m pytest tests/test_reconcile.py -q
+```
+
+DB-free: exercises counters, ledger accounting, verdicts (incl. DRIFT), and the
+renderer against synthetic fixtures.

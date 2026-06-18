@@ -40,6 +40,37 @@ class FlaskLoader:
         if tenant_domain:
             self.headers["Host"] = tenant_domain.strip()
 
+    def _record_source_map(self, entity, odoo_id, flask_id, sub_key=""):
+        """Record an odoo->flask mapping in the migration ledger for entities
+        created via the native routes (processing_activity, template), so they
+        become idempotent + auditable like the /migration/* entities.
+
+        Best-effort: a recorder failure is logged, never fatal to the load. The
+        endpoint is idempotent (200 'exists' when already recorded)."""
+        if not odoo_id or flask_id is None:
+            return
+        try:
+            resp = requests.post(
+                f"{self.base_url}/migration/source-map",
+                headers=self.headers,
+                json={
+                    "entity": entity,
+                    "odoo_source_id": int(odoo_id),
+                    "flask_id": int(flask_id),
+                    "sub_key": sub_key or "",
+                },
+                timeout=30,
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"source-map record failed {entity} {odoo_id}->{flask_id}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except (TypeError, ValueError):
+            logger.warning(f"source-map skip {entity}: bad ids {odoo_id}->{flask_id}")
+        except Exception as e:
+            logger.warning(f"source-map record exception {entity} {odoo_id}: {e}")
+
     def load_from_csv(self, csv_filename: str, endpoint: str):
         input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
         if not os.path.exists(input_path):
@@ -549,12 +580,18 @@ class FlaskLoader:
                     if new_id:
                         name_to_id[name] = new_id
                     logger.info(f"Created PA '{name}' (id={new_id})")
+                    # Ledger the mapping so PA loads are idempotent + auditable.
+                    self._record_source_map("processing_activity", row.get("odoo_id"), new_id)
                     success_count += 1
                 elif response.status_code == 400 and "already exists" in response.text.lower():
                     logger.info(f"PA '{name}' already exists. Skipping.")
                     skip_count += 1
                     # Refresh map so children can resolve this parent
                     name_to_id = self._resolve_pa_ids()
+                    # Record the existing PA too, so a re-run backfills the ledger.
+                    self._record_source_map(
+                        "processing_activity", row.get("odoo_id"), name_to_id.get(name)
+                    )
                 else:
                     logger.error(f"Failed PA '{name}': {response.status_code} - {response.text[:300]}")
                     failure_count += 1
@@ -699,6 +736,9 @@ class FlaskLoader:
 
         # Pre-fetch existing template names to skip duplicates
         existing_names = self._fetch_existing_template_names()
+        # name -> flask id, used to ledger templates that already exist (so a
+        # re-run backfills the source-map for previously-loaded templates).
+        existing_template_ids = self._fetch_template_id_map()
         pa_map = self._resolve_pa_ids()
 
         # name -> Flask id captured from each create response, so a follow-up
@@ -717,6 +757,13 @@ class FlaskLoader:
             if name in existing_names:
                 logger.info(f"Template '{name}' already exists. Skipping.")
                 skip_count += 1
+                # Backfill the ledger for an already-loaded template.
+                tmpl_sub_key = "|".join(str(row.get(c) or "") for c in
+                                        ("template_type", "sub_type", "language"))
+                self._record_source_map(
+                    "template", row.get("odoo_id"),
+                    existing_template_ids.get(name), sub_key=tmpl_sub_key,
+                )
                 continue
 
             pa_names_str = row.get("processing_activity_names")
@@ -769,6 +816,14 @@ class FlaskLoader:
                     if new_id:
                         created_ids[name] = new_id
                     logger.info(f"Created template '{name}' (id={new_id})")
+                    # Ledger every emitted template row under its Odoo source id.
+                    # sub_key discriminates fan-out (same odoo_id across multiple
+                    # type/channel/language rows) so each lands a distinct mapping.
+                    tmpl_sub_key = "|".join(str(row.get(c) or "") for c in
+                                            ("template_type", "sub_type", "language"))
+                    self._record_source_map(
+                        "template", row.get("odoo_id"), new_id, sub_key=tmpl_sub_key
+                    )
                     success_count += 1
                     existing_names.add(name)
                 else:

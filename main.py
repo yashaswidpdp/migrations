@@ -530,9 +530,16 @@ def stakeholder_run_all():
 @cli.command()
 @click.option("--no-write", is_flag=True, help="Print only; do not write the .txt report file.")
 @click.option("--self-test", "self_test", is_flag=True, help="Run internal consistency checks and exit.")
-def reconcile(no_write, self_test):
+@click.option("--live", is_flag=True, help="Verify against live Odoo (SOURCE) + live Flask app (MIGRATED); surfaces DRIFT. Reads tokens from config/.env.")
+def reconcile(no_write, self_test, live):
     """Audit Odoo->Flask completeness: per-entity source vs migrated ledger."""
+    import scripts.report.reconcile as recon
     from scripts.report.reconcile import run_reconciliation, self_test as _st, REPORT_PATH
+    if live:
+        recon.LIVE = True
+        if not (recon.FLASK_API_BASE_URL and recon.FLASK_API_KEY):
+            click.echo("WARN: --live set but FLASK_API_BASE_URL / FLASK_API_KEY missing in "
+                       "config/.env; dest verification will read n/a.", err=True)
     if self_test:
         problems = _st()
         click.echo("SELF-TEST: " + ("PASS" if not problems else "FAIL"))

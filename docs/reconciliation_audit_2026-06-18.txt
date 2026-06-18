@@ -1,0 +1,153 @@
+================================================================================
+  ODOO -> FLASK MIGRATION : RECONCILIATION AUDIT
+  generated 2026-06-18 06:52:46
+  mode   : LIVE  (SOURCE = live Odoo re-count | MIGRATED verified vs live Flask)
+  truth  : migration_source_map (live Postgres ledger)
+================================================================================
+
+SUMMARY  (migrated / source)
+--------------------------------------------------------------------------------
+  entity                    src   migr   fail   acc   unexp      %    verdict
+  ----------------------    ----  ----   ----   ---   -----    -----  ---------
+  Consent                   460    331    129     0       0    72.0%  ! DRIFT(*)
+  Data Principal Request     71     71      0     0       0   100.0%  + PASS
+  Vendor                     12     11      1     1       0    91.7%  + PASS*
+  Internal Stakeholder        8      8      0     0       0   100.0%  + PASS
+  Processing Activity        27    n/a      0     0     n/a      n/a  ? UNTRACKED
+  Template                   28    n/a      0     0     n/a      n/a  ? UNTRACKED
+  ----------------------    ----  ----   ----   ---   -----    -----  ---------
+  TRACKED ENTITIES OVERALL: 421 / 551 = 76.4%
+
+  legend  src=Odoo source  migr=landed in Flask  fail=rejected
+          acc=accepted-loss  unexp=unexplained
+  verdict + PASS   migrated == source
+          + PASS*  shortfall fully covered by accepted-loss
+          ! DRIFT  ledger says landed, live app disagrees
+          ? UNTRACKED  not source-map tracked (cannot prove per-record)
+
+  (*) Consent DRIFT is UNVERIFIED — see KNOWN ISSUE below. The live-list read
+      paginated only the first 100 rows, so the "231 missing" figure is a
+      reader artifact, NOT confirmed data loss.
+
+================================================================================
+PER-ENTITY DETAIL
+================================================================================
+
+[1] CONSENT  ........................................  72.0%   ! DRIFT (unverified)
+    source        : 460   (raw_consents.csv)
+    staged        : 460   (legacy 448 + paper 12)
+    migrated      : 331   (migration_source_map['consent'])
+    flask db rows : 331   (consents table)
+    live source   : 460   (live Odoo re-count)
+    live in app   : 100   (GET /consent/)  <-- capped at page 1, see KNOWN ISSUE
+    failed        : 129   x "No active license available"  (operational)
+    drift (raw)   : 231   ledger flask_ids not seen in the (partial) live read
+                          UNVERIFIED: live read only fetched 100 of 331 rows.
+
+[2] DATA PRINCIPAL REQUEST  .........................  100.0%  + PASS
+    source        : 71    (raw_requests.csv)
+    staged        : 71
+    migrated      : 71    (migration_source_map['request'])
+    flask db rows : 71    (requests table)
+    live source   : 71    (live Odoo re-count)
+
+[3] VENDOR  .........................................  91.7%   + PASS*
+    source        : 12    (raw_vendors.json)
+    staged        : 12
+    migrated      : 11    (migration_source_map['vendor'])
+    flask db rows : 11    (vendors table)
+    live source   : 12    (live Odoo re-count)
+    live in app   : 11    (GET /vendor/list)  -- matches migrated
+    failed        : 1     x "User 'test02' already exists with role 'DataPrincipal'"
+    accepted loss : 1     odoo#4  test02@yopmail.com already belongs to
+                          DataPrincipal user 1089; one user cannot be both
+                          DataPrincipal and Vendor. Accepted unmigrated
+                          2026-06-17 (test data).
+
+[4] INTERNAL STAKEHOLDER  ...........................  100.0%  + PASS
+    source        : 8     (raw_stakeholders.json)
+    staged        : 8
+    migrated      : 8     (migration_source_map['stakeholder'])
+    live source   : 8     (live Odoo re-count)
+    live in app   : 11    (GET /auth/backend-users)  -- app has pre-existing users
+    note          : endpoint hardcodes user_role_type=PAManager; Odoo DPO vs
+                    PA Manager distinction not preserved.
+
+[5] PROCESSING ACTIVITY  ............................  n/a     ? UNTRACKED
+    source        : 27    (raw_processing_activities.json, tree)
+    staged        : 27
+    migrated      : not source-map tracked
+    flask db rows : 38    (processing_activity table)
+    live source   : 27    (live Odoo re-count)
+    live in app   : 36    (GET /processing/activities/simple)
+    note          : no source-map tracking -> not idempotent / not auditable
+                    per-record.
+
+[6] TEMPLATE  .......................................  n/a     ? UNTRACKED
+    source        : 28    (raw_templates.json)
+    staged        : 28    (expanded rows)
+    migrated      : not source-map tracked
+    flask db rows : 251   (notice_templates table)
+    live source   : 28    (live Odoo re-count)
+    live in app   : 100   (GET /notice-templates/)  <-- also capped at page 1
+    note          : one Odoo template fans out to many notice/email rows; not
+                    source-map tracked.
+
+================================================================================
+KNOWN ISSUE : live-list pagination cap (affects the Consent DRIFT only)
+================================================================================
+  The --live reader requests page_size=500 but the Flask list endpoints cap the
+  response at 100 rows and ignore the size hint. The reader's stop condition
+  (len(rows) < requested_size) then treats the first 100-row page as the full
+  set and stops. Consequently:
+    - Consent  live-in-app shows 100 (of 331 truly migrated)  -> 231 false DRIFT
+    - Template live-in-app shows 100 (untracked, so no drift computed)
+  Entities under 100 live rows (request, vendor, stakeholder, PA) are unaffected
+  and their numbers are trustworthy.
+  ACTION: fix the pager to follow the API's real page param, then re-run
+  `python main.py reconcile --live`. Only after that is the Consent DRIFT real
+  or cleared.
+
+================================================================================
+REMAINING REQUIREMENTS  (ranked)
+================================================================================
+  1. [HIGH] Recover 129 license-blocked consents
+        Failures are "No active license available" (operational, not data).
+        Add license capacity, then re-run `consent load`; they should land.
+
+  2. [HIGH] Fix live-reader pagination, then re-confirm Consent DRIFT
+        Current 231-drift is a 100-row page-1 artifact, not proven loss. Page
+        through all rows before treating any Consent record as dropped.
+
+  3. [MED] Add source-map tracking for Processing Activity
+        Not in migration_source_map -> re-runs not idempotent, completion not
+        auditable per-record. Mirror the vendor/stakeholder pattern.
+
+  4. [MED] Add source-map tracking for Template
+        Same gap as Processing Activity. One Odoo template fans out to many
+        rows (db shows 251), so tracking must map source id -> all emitted ids.
+
+  5. [MED] Decide DPO vs PA Manager role fidelity
+        All stakeholders land as user_role_type=PAManager; Odoo DPO distinction
+        is lost. If DPO must persist, backfill via /stakeholder/<id>/update-roles.
+
+  6. [LOW] Rotate shared secrets
+        Odoo JWT + Flask API key were exposed during debugging; rotate and
+        confirm config/.env stays gitignored.
+
+================================================================================
+METHODOLOGY / LIMITATIONS
+================================================================================
+  - 'migrated' = rows in live migration_source_map (idempotency ledger), the
+    only authoritative "landed in Flask" signal. consent/request/vendor/
+    stakeholder are tracked; processing_activity + template are NOT, so their
+    completion cannot be proven per-record yet.
+  - 'live in app' = records returned by the destination Flask GET list. It
+    reflects ALL records in the app (incl. pre-existing + fan-out rows), not
+    only migrated ones, so it can legitimately exceed 'migrated'.
+  - 'failed' counts come from data/processed/errors_*.csv (latest load run).
+  - 'accepted loss' is the operator-maintained data/accepted_loss.json.
+  - Any read failure renders as n/a rather than aborting the audit.
+  - DRIFT is only as complete as the live read; see KNOWN ISSUE for the current
+    pagination limit.
+================================================================================
