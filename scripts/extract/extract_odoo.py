@@ -245,6 +245,22 @@ def run_template_extraction(output_file: str, template_type: str = None):
         logger.error("Template extraction returned empty response.")
 
 
+def run_request_type_extraction(output_file: str = "raw_request_types.json"):
+    """Extract all request types from Odoo (/request-types) and save the
+    `requestTypes` array as JSON. Source for the Flask request_types seed that
+    must exist before consents/requests load."""
+    extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
+    raw = extractor.fetch_simple("/request-types")
+    if not raw:
+        logger.error("Request-type extraction returned empty response.")
+        return
+    records = raw.get("requestTypes", []) if isinstance(raw, dict) else raw
+    if not records:
+        logger.error("Request-type response had no 'requestTypes' array.")
+        return
+    extractor.save_to_json(records, output_file)
+
+
 def run_vendor_extraction(output_file: str = "raw_vendors.json"):
     """Extract all vendors from Odoo (/vendors_details) and save as JSON."""
     extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
@@ -273,17 +289,23 @@ def run_stakeholder_extraction(output_file: str = "raw_stakeholders.json"):
 
 def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     """Enrich the dashboard request CSV with the per-record by-id fields the
-    dashboard omits — chiefly `requestType [id, name]`, plus the assignee
-    email/phone carried in `trackAssigneeStatus`. Adds columns in place.
+    dashboard omits — chiefly `requestType [id, name]`, the assignee carried in
+    `trackAssigneeStatus`, the internal allottee in `assignToDM`, and the vendor
+    handling the request in `assignToVendor` (the vendor<->request "activity"
+    linkage). Adds columns in place.
 
-    `/dpgr/dashboard` has no request type at all; `GET /dpgr/id?id=<N>` does.
+    `/dpgr/dashboard` has no request type / assignee / vendor link at all;
+    `GET /dpgr/id?id=<N>` carries all of them.
     """
     import json
     path = os.path.join(DATA_RAW_DIR, raw_file)
     if not os.path.exists(path):
         logger.error(f"Cannot enrich, raw file not found: {path}")
         return
-    df = pd.read_csv(path)
+    # phone as string: this function rewrites the CSV (df.to_csv below), so a
+    # float-inferred phone ('0025520778' -> 25520778.0) would be persisted back
+    # into the raw file and lose its leading zeros before transform ever runs.
+    df = pd.read_csv(path, dtype={"phone": str})
     if "id" not in df.columns:
         logger.error("Request CSV has no 'id' column; cannot enrich by id.")
         return
@@ -292,19 +314,32 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     # as new columns the transform reads.
     byid_cols = ("dpComment", "escalatedComment", "escalatedDate",
                  "closingComment", "withdrawalComment", "iPAddress",
-                 "deviceType", "resolutionDate", "closedOn")
+                 "deviceType", "resolutionDate", "closedOn", "actionDate")
 
     extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
     request_types, assignee_emails, consents = [], [], []
+    # New: vendor<->request activity link + real internal allottee. Both arrive
+    # as `[ {id, name} ]` arrays on /dpgr/id; carried verbatim as JSON so the
+    # transform owns the id/name extraction (mirrors the `consent` column).
+    assign_to_vendors, assign_to_dms = [], []
+    assignee_names, assignee_statuses, assignee_raised_ons = [], [], []
     extra = {col: [] for col in byid_cols}
     for i, rec_id in enumerate(df["id"].tolist(), 1):
         rec = extractor.fetch_by_id("/dpgr/id", rec_id, result_key="dpgr")
         request_types.append(json.dumps(rec.get("requestType")) if rec.get("requestType") else "")
         track = rec.get("trackAssigneeStatus") or []
-        email = track[0].get("email") if track and isinstance(track[0], dict) else ""
-        assignee_emails.append(email or "")
+        first = track[0] if track and isinstance(track[0], dict) else {}
+        assignee_emails.append(first.get("email") or "")
+        # Real internal assignee identity (status + when) — previously dropped, so
+        # every migrated request lost "who it was allotted to". `assignedTo,` is
+        # the (typo'd) Odoo key carrying `[id, name]`.
+        assignee_statuses.append(first.get("status") or "")
+        assignee_raised_ons.append(first.get("raisedOn") or "")
         # Linked consent(s) for revoke requests -> the transform extracts the ids.
         consents.append(json.dumps(rec.get("consent")) if rec.get("consent") else "")
+        # Vendor handling the request + internal allottee (Data Manager).
+        assign_to_vendors.append(json.dumps(rec.get("assignToVendor")) if rec.get("assignToVendor") else "")
+        assign_to_dms.append(json.dumps(rec.get("assignToDM")) if rec.get("assignToDM") else "")
         for col in byid_cols:
             extra[col].append(rec.get(col) or "")
         if i % 25 == 0:
@@ -312,12 +347,18 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
 
     df["requestType"] = request_types
     df["assignee_email"] = assignee_emails
+    df["assignee_status"] = assignee_statuses
+    df["assignee_raised_on"] = assignee_raised_ons
     df["consent"] = consents
+    df["assignToVendor"] = assign_to_vendors
+    df["assignToDM"] = assign_to_dms
     for col in byid_cols:
         df[col] = extra[col]
     df.to_csv(path, index=False)
     filled = sum(1 for x in request_types if x)
-    logger.info(f"Request enrichment done: {filled}/{len(df)} rows now carry requestType. Updated {path}")
+    vfilled = sum(1 for x in assign_to_vendors if x)
+    logger.info(f"Request enrichment done: {filled}/{len(df)} rows carry requestType, "
+                f"{vfilled}/{len(df)} carry a vendor link. Updated {path}")
 
 
 def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
@@ -330,7 +371,8 @@ def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
     if not os.path.exists(path):
         logger.error(f"Cannot enrich, raw file not found: {path}")
         return
-    df = pd.read_csv(path)
+    # phone as string (this function also rewrites the CSV) — keep leading zeros.
+    df = pd.read_csv(path, dtype={"phone": str})
     if "id" not in df.columns:
         logger.error("Consent CSV has no 'id' column; cannot enrich by id.")
         return
