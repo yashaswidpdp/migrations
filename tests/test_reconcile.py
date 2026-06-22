@@ -269,7 +269,7 @@ def test_compare_record_skips_missing_source_flags_real_diff():
     # source name present but differs -> mismatch; email absent on source -> skipped
     src = {"name": [9, "Asha"], "status": "Consented"}
     dst = {"name": "Asha Kumar", "email": "x@y.com", "status": "Consented"}
-    diffs, cov = R.compare_record("consent", src, dst)
+    diffs, cov, _ = R.compare_record("consent", src, dst)
     labels = [d[0] for d in diffs]
     assert "name" in labels            # 'asha' != 'ashakumar'
     assert "email" not in labels       # source had no eMail -> not comparable
@@ -283,7 +283,7 @@ def test_compare_record_autopairs_unmapped_fields_and_reports_coverage():
     src = {"name": [1, "X"], "created_at": "2024-01-01", "history": [{"e": 1}],
            "odoo_only_field": "z"}
     dst = {"name": "X", "created_at": "2024-01-02"}     # date differs
-    diffs, cov = R.compare_record("consent", src, dst)
+    diffs, cov, _ = R.compare_record("consent", src, dst)
     labels = [d[0] for d in diffs]
     assert "created_at" in labels                       # auto-paired mismatch
     assert "created_at" in cov["compared_src"]
@@ -296,10 +296,54 @@ def test_compare_record_list_length_diff():
     # audit-log / attachment arrays: length-compared (not deep), surfaced on diff
     src = {"name": [1, "X"], "history": [{"e": 1}, {"e": 2}, {"e": 3}]}
     dst = {"name": "X", "history": [{"e": 1}]}            # 3 vs 1
-    diffs, cov = R.compare_record("consent", src, dst)
+    diffs, cov, _ = R.compare_record("consent", src, dst)
     labels = [d[0] for d in diffs]
     assert "history[len]" in labels
     assert "history" in cov["compared_src"]              # paired -> not "unchecked"
+
+
+def test_request_no_is_excluded_like_id():
+    # request_no is Flask-regenerated at load -> never equals source; must NOT flag
+    src = {"name": [1, "X"], "requestNo": "03062026010538000071", "phone": "9000000555"}
+    dst = {"name": "X", "request_no": "21062026235916169241", "phone": "9000000555"}
+    diffs, cov, _ = R.compare_record("request", src, dst)
+    labels = [d[0].lower() for d in diffs]
+    assert not any("request" in l for l in labels)   # request_no suppressed
+
+
+def test_template_language_and_type_mapped_not_false_diffed():
+    # language arrives as {'id','name'}; template_type as a raw code -> both must be
+    # mapped to the Flask label before compare so a correct migration shows no diff
+    src = {"name": "T", "language": {"id": 5, "name": "English"},
+           "templateType": "online", "subType": "email"}
+    dst = {"name": "T", "language": "English",
+           "template_type": "Live Consent Template", "sub_type": "Email"}
+    diffs, _, _ = R.compare_record("template", src, dst)
+    assert not diffs                                  # no false positives
+
+
+def test_stakeholder_email_not_compared():
+    # /auth/backend-users omits email -> dest None; comparing would false-diff
+    src = {"name": "Rahul", "login": "rahul@yopmail.com"}
+    dst = {"name": "Rahul"}
+    diffs, _, _ = R.compare_record("stakeholder", src, dst)
+    assert not diffs
+
+
+def test_dead_token_does_not_masquerade_as_pass(monkeypatch):
+    # LIVE run where the Flask read failed (live_dest_ids=None): a count-match must
+    # become UNVERIFIED (not PASS) and the report must carry the loud banner.
+    monkeypatch.setattr(R, "LIVE", True)
+    spec = R.EntitySpec("consent", "Consent", lambda: 467, "raw", [],
+                        "consent", None, "consents")
+    res = R.EntityResult(spec=spec, source=467, staged=[], migrated=467,
+                         db_rows=467, failed=0,
+                         fail_reasons=R.collections.Counter(), live_dest_ids=None)
+    assert res.live_unverified is True
+    assert res.verdict == "UNVERIFIED"          # NOT "PASS"
+    out = R.render([res])
+    assert "LIVE VERIFY FAILED" in out
+    assert "UNVERIFIED" in out
 
 
 def test_run_field_diff_joins_and_counts(monkeypatch):
