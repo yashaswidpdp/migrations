@@ -11,6 +11,7 @@ from scripts.extract.extract_odoo import (
     run_stakeholder_extraction,
     run_request_enrichment,
     run_consent_enrichment,
+    run_request_type_extraction,
 )
 from scripts.transform.transform_consent import transform_consent_data
 from scripts.transform.transform_request import transform_request_data
@@ -18,9 +19,11 @@ from scripts.transform.transform_processing_activity import transform_processing
 from scripts.transform.transform_template import transform_template_data
 from scripts.transform.transform_vendor import transform_vendor_data
 from scripts.transform.transform_stakeholder import transform_stakeholder_data
+from scripts.transform.transform_request_type import transform_request_type_data
 from scripts.load.load_flask import (
     run_loading,
     run_request_type_seeding,
+    run_request_type_loading,
     run_legacy_loading,
     run_paper_loading,
     run_consent_migration_loading,
@@ -29,6 +32,7 @@ from scripts.load.load_flask import (
     run_template_loading,
     run_template_approval,
     run_template_load_and_approve,
+    run_template_pa_link_patch,
     run_vendor_loading,
     run_stakeholder_loading,
 )
@@ -136,6 +140,68 @@ def run_all():
         click.echo(f"Error: {e}", err=True)
 
 # ==========================================
+# REQUEST TYPE COMMANDS  (master data — run before consents + requests)
+# ==========================================
+@cli.group(name="request-type")
+def request_type():
+    """Commands for migrating Request Types (Odoo /request-types -> Flask /request-types/create)"""
+    pass
+
+
+@request_type.command()
+def extract():
+    """Stage 1: Extract request types from Odoo -> data/raw/raw_request_types.json"""
+    logger.info("Starting request-type extraction...")
+    try:
+        run_request_type_extraction("raw_request_types.json")
+        click.echo("Extracted to data/raw/raw_request_types.json")
+    except Exception as e:
+        logger.error(f"Extraction failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command()
+def transform():
+    """Stage 1.5: Rename Odoo fields -> Flask -> data/processed/processed_request_types.json"""
+    logger.info("Starting request-type transformation...")
+    try:
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        click.echo("Transformation complete. Check data/processed/processed_request_types.json")
+    except Exception as e:
+        logger.error(f"Transformation failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command()
+def load():
+    """Stage 2: Load request types into Flask (idempotent by name)"""
+    logger.info("Starting request-type load...")
+    try:
+        run_request_type_loading("processed_request_types.json")
+        click.echo("Request-type loading complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Loading failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command(name="run-all")
+def request_type_run_all():
+    """Run full pipeline: Extract -> Transform -> Load. Run before consents + requests."""
+    logger.info("Starting full request-type migration pipeline")
+    try:
+        click.echo("Stage 1: Extracting...")
+        run_request_type_extraction("raw_request_types.json")
+        click.echo("Stage 1.5: Transforming...")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        click.echo("Stage 2: Loading...")
+        run_request_type_loading("processed_request_types.json")
+        click.echo("Full request-type migration completed.")
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+# ==========================================
 # REQUEST COMMANDS
 # ==========================================
 @cli.group()
@@ -214,8 +280,10 @@ def run_all(user_id):
         click.echo("Stage 1.5: Transforming...")
         transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
 
-        click.echo("Stage 1.8: Seeding request types (idempotent)...")
-        run_request_type_seeding("request_types_seed.json")
+        click.echo("Stage 1.8: Loading request types from Odoo extract (idempotent)...")
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
 
         click.echo("Stage 2: Loading...")
         run_loading("processed_requests.csv", "/migration/request")
@@ -369,6 +437,21 @@ def approve():
         click.echo("Template approval complete. Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Approval failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@template.command(name="patch-pa-links")
+def patch_pa_links():
+    """Backfill processing-activity links onto templates already in Flask.
+
+    Re-runnable + idempotent. Use after PAs are loaded (or after fixing PA
+    resolution) to wire template<->PA links without re-creating templates."""
+    logger.info("Starting Template PA-link patch...")
+    try:
+        run_template_pa_link_patch("processed_templates.csv")
+        click.echo("Template PA-link patch complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Template PA-link patch failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 
@@ -531,7 +614,8 @@ def stakeholder_run_all():
 @click.option("--no-write", is_flag=True, help="Print only; do not write the .txt report file.")
 @click.option("--self-test", "self_test", is_flag=True, help="Run internal consistency checks and exit.")
 @click.option("--live", is_flag=True, help="Verify against live Odoo (SOURCE) + live Flask app (MIGRATED); surfaces DRIFT. Reads tokens from config/.env.")
-def reconcile(no_write, self_test, live):
+@click.option("--cached-source", "cached_source", is_flag=True, help="With --live: take SOURCE from the data/raw snapshot instead of re-pulling Odoo (skips the full re-extract; field-diff + DRIFT still run live against Flask).")
+def reconcile(no_write, self_test, live, cached_source):
     """Audit Odoo->Flask completeness: per-entity source vs migrated ledger."""
     import scripts.report.reconcile as recon
     from scripts.report.reconcile import run_reconciliation, self_test as _st, REPORT_PATH
@@ -540,6 +624,10 @@ def reconcile(no_write, self_test, live):
         if not (recon.FLASK_API_BASE_URL and recon.FLASK_API_KEY):
             click.echo("WARN: --live set but FLASK_API_BASE_URL / FLASK_API_KEY missing in "
                        "config/.env; dest verification will read n/a.", err=True)
+    if cached_source:
+        recon.CACHED_SOURCE = True
+        if not live:
+            click.echo("NOTE: --cached-source only affects --live runs.", err=True)
     if self_test:
         problems = _st()
         click.echo("SELF-TEST: " + ("PASS" if not problems else "FAIL"))
