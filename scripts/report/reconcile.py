@@ -48,13 +48,14 @@ Self-test (DB-free internal consistency check):
 
 from __future__ import annotations
 
+import ast
 import collections
 import csv
 import json
 import os
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 # Load migration/config/.env (same file load_flask uses) so tokens live in one
@@ -87,6 +88,12 @@ PG_DB = os.getenv("RECON_PG_DB", "privacium_db")
 #   FLASK_TENANT_DOMAIN          optional Host header for the Flask container
 #   RECON_HTTP_TIMEOUT           per-request seconds (default 20)
 LIVE = os.getenv("RECON_LIVE") == "1"
+# Cached-source mode (--cached-source / RECON_CACHED_SOURCE=1): in LIVE mode, take
+# the SOURCE side from the already-extracted raw snapshot files (data/raw/*)
+# instead of re-pulling the whole dataset from Odoo. The field diff + DRIFT still
+# run against the live Flask app; only the expensive Odoo re-extract is skipped
+# (e.g. 15k consents = a ~13-min dashboard re-pull every reconcile otherwise).
+CACHED_SOURCE = os.getenv("RECON_CACHED_SOURCE") == "1"
 ODOO_BASE_URL = os.getenv("ODOO_BASE_URL",
                           "https://tool.dpdp-portal.dpdpconsultants.com/api")
 ODOO_JWT_TOKEN = os.getenv("ODOO_JWT_TOKEN")
@@ -255,9 +262,12 @@ def sourcemap_pairs() -> dict:
 FLASK_PER_PAGE = 100  # server hard cap (get_pagination_params max_per_page)
 FLASK_LIST_ENDPOINTS = {
     "consent": ("/consent/", "id", ("records", "consents", "data", "results", "items")),
+    "request": ("/request/open-request", "id", ("records", "results", "items")),
     "vendor": ("/vendor/list", "id", ("records", "vendors", "data", "results", "items")),
     "stakeholder": ("/auth/backend-users", "id", ("records", "users", "data", "results", "items")),
-    "processing_activity": ("/processing/activities/simple", "id",
+    # full endpoint (NOT /simple) so INACTIVE PAs are counted too — they are
+    # migrated and must reconcile; /simple returns active-only -> false DRIFT.
+    "processing_activity": ("/processing/activities", "id",
                             ("records", "activities", "data", "results", "items")),
     "template": ("/notice-templates/", "id", ("records", "templates", "data", "results", "items")),
 }
@@ -406,13 +416,96 @@ def live_source_count(entity: str) -> Optional[int]:
     return None
 
 
+def _coerce_cell(v):
+    """A CSV snapshot stringifies nested values (Odoo `name` -> "[2, 'Chetan']",
+    history -> "[]"). Restore Python lists/dicts so the field-diff sees the same
+    shapes it would from a live Odoo dict (e.g. _arr(name, 1) needs a real list).
+    pandas NaN -> None."""
+    if v is None:
+        return None
+    if isinstance(v, float) and v != v:  # NaN
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if s[:1] in "[{":
+            try:
+                return ast.literal_eval(s)
+            except (ValueError, SyntaxError):
+                return v
+    return v
+
+
+def cached_source_records(entity: str) -> Optional[dict]:
+    """{odoo_id(str): source_record} read from the data/raw snapshot instead of
+    Odoo. Mirrors live_source_records' output shape so the field diff is identical.
+    None => the snapshot file is missing/unreadable (caller falls back / skips)."""
+    def _by_id(rows):
+        out = {}
+        for r in rows or []:
+            if isinstance(r, dict) and r.get("id") is not None:
+                out[str(r["id"]).strip()] = r
+        return out
+
+    try:
+        if entity in ("consent", "request"):
+            path = f"{RAW_DIR}/raw_{'consents' if entity=='consent' else 'requests'}.csv"
+            if not os.path.exists(path):
+                return None
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = [{k: _coerce_cell(v) for k, v in r.items()}
+                        for r in csv.DictReader(f)]
+            return _by_id(rows)
+
+        # JSON snapshots already carry native types — no coercion needed.
+        json_specs = {
+            "vendor": (f"{RAW_DIR}/raw_vendors.json", ("vendors",)),
+            "stakeholder": (f"{RAW_DIR}/raw_stakeholders.json", ("stakeholders",)),
+            "template": (f"{RAW_DIR}/raw_templates.json", ("templates", "data")),
+        }
+        if entity in json_specs:
+            path, keys = json_specs[entity]
+            if not os.path.exists(path):
+                return None
+            with open(path, encoding="utf-8") as f:
+                return _by_id(_find_list_of_dicts(json.load(f), keys))
+
+        if entity == "processing_activity":
+            path = f"{RAW_DIR}/raw_processing_activities.json"
+            if not os.path.exists(path):
+                return None
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            flat = {}
+
+            def walk(node):
+                if isinstance(node, dict):
+                    if node.get("id") is not None and "name" in node:
+                        flat[str(node["id"]).strip()] = node
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(raw.get("processingActivities") if isinstance(raw, dict) else raw)
+            return flat or None
+    except Exception:
+        return None
+    return None
+
+
 def live_source_records(entity: str) -> Optional[dict]:
-    """{odoo_id(str): source_record} pulled live from Odoo, for field-level diff.
-    None => unreadable. Tree entities (PA) are flattened to their id-bearing nodes.
-    Cached per run."""
+    """{odoo_id(str): source_record} for the field-level diff. In cached-source mode
+    this comes from the data/raw snapshot (no Odoo hit); otherwise it is pulled
+    live from Odoo. None => unreadable. Tree entities (PA) are flattened to their
+    id-bearing nodes. Cached per run."""
     ck = ("src", entity)
     if ck in _LIVE_CACHE:
         return _LIVE_CACHE[ck]
+    if CACHED_SOURCE:
+        result = cached_source_records(entity)
+        if result is not None:
+            _LIVE_CACHE[ck] = result
+        return result
     if not ODOO_JWT_TOKEN:
         return None
     try:
@@ -582,8 +675,31 @@ def _n_digits(v):
 
 
 def _n_date(v):
-    d = _parse_iso_or_dmy(v)
+    """Normalize to a UTC calendar-date string. The Flask side serializes dates in
+    IST (+05:30) while the Odoo source is naive UTC; comparing raw calendar dates
+    would falsely flag any evening-UTC row that crosses midnight in IST. So parse
+    each side, convert any tz-aware value back to UTC, then compare date-only."""
+    d = _parse_dt_utc(v)
     return d.date().isoformat() if d else _n_token(v)
+
+
+def _parse_dt_utc(value):
+    """Parse a timestamp to a naive-UTC datetime. fromisoformat handles an explicit
+    offset like '+05:30' (the IST dest); once converted to UTC the date matches the
+    naive-UTC source. Falls back to the strptime formats for non-ISO inputs."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is not None:
+            d = d.astimezone(timezone.utc).replace(tzinfo=None)
+        return d
+    except ValueError:
+        pass
+    return _parse_iso_or_dmy(s)
 
 
 def _parse_iso_or_dmy(value):
@@ -617,6 +733,33 @@ def _arr(value, idx):
     return value
 
 
+def _lang_name(v):
+    """Odoo template language arrives as {'id': 5, 'name': 'English'}; Flask stores
+    the bare name. Pull the name so the two sides are comparable."""
+    if isinstance(v, dict):
+        return v.get("name")
+    return v
+
+
+# Reuse the loader's own template-type derivation so the source side is mapped to
+# the exact Flask label (depends on BOTH templateType and subType), instead of
+# comparing the raw Odoo code 'online'/'consent' to the mapped Flask label and
+# always diffing. Import is best-effort: on failure we fall back to the raw value.
+try:
+    from scripts.transform.transform_template import _map_template_type as _tmpl_type_of
+except Exception:
+    _tmpl_type_of = None
+
+
+def _src_template_type(s):
+    if _tmpl_type_of is not None:
+        try:
+            return _tmpl_type_of(s.get("templateType", ""), s.get("subType", ""))
+        except Exception:
+            pass
+    return s.get("template_type") or s.get("templateType")
+
+
 # Known enum divergences (everything else is handled by plain token-equality).
 _CONSENT_PROC_TYPE = {"mandatory": "mandatoryregulatory"}
 _REQ_STATUS = {
@@ -624,6 +767,24 @@ _REQ_STATUS = {
     "assignedtodpo": "assigntodpo",
     "assigntopamanager": "assigntopamanager",
 }
+# Odoo sub_type codes the transform intentionally maps to a Flask SubTypeEnum:
+# 'msg91' is an SMS gateway, so it correctly lands as 'SMS'. Treat them equal.
+_TEMPLATE_SUB_TYPE = {"msg91": "sms"}
+
+# Boolean equivalence: Odoo serializes booleans as 'yes'/'no', Flask as
+# True/False (and sometimes 1/0). Canonicalize both sides so yes==True, no==False.
+_BOOL_TRUE = {"yes", "true", "1", "y", "t"}
+_BOOL_FALSE = {"no", "false", "0", "n", "f"}
+
+
+def _bool_norm(v):
+    t = _n_token(v)
+    if t in _BOOL_TRUE:
+        return "true"
+    if t in _BOOL_FALSE:
+        return "false"
+    return t
+
 
 # entity -> list of (label, source_getter, dest_getter, normalizer)
 FIELD_MAPS = {
@@ -636,6 +797,12 @@ FIELD_MAPS = {
         ("legacy_type", lambda s: s.get("legacyType"), lambda d: d.get("legacy_type"), _n_token),
         ("processing_type", lambda s: s.get("userActivityType"),
          lambda d: d.get("processing_type"), _alias(_CONSENT_PROC_TYPE)),
+        # date fields (UTC calendar-date compare; dest is IST -> normalized to UTC)
+        ("sent_on", lambda s: s.get("sentOn"), lambda d: d.get("sent_on"), _n_date),
+        ("delivery_on", lambda s: s.get("deliveredOn"), lambda d: d.get("delivery_on"), _n_date),
+        ("valid_till", lambda s: s.get("validTill"), lambda d: d.get("valid_till"), _n_date),
+        ("created_at", lambda s: s.get("createdOn"), lambda d: d.get("created_at"), _n_date),
+        ("closed_on", lambda s: s.get("closedOn"), lambda d: d.get("closed_on"), _n_date),
     ],
     "request": [
         ("name", lambda s: _arr(s.get("name"), 1) if isinstance(s.get("name"), list) else s.get("name"),
@@ -643,13 +810,21 @@ FIELD_MAPS = {
         ("email", lambda s: s.get("eMail"), lambda d: d.get("email"), _n_token),
         ("phone", lambda s: s.get("phone"), lambda d: d.get("phone"), _n_digits),
         ("status", lambda s: s.get("status"), lambda d: d.get("status"), _alias(_REQ_STATUS)),
+        # /open-request list serializes only created_at among dates (closed_on /
+        # action_date are NOT in that endpoint -> not comparable without false
+        # positives; see METHODOLOGY).
+        ("created_at", lambda s: s.get("createOn"), lambda d: d.get("created_at"), _n_date),
     ],
     "template": [
         ("name", lambda s: s.get("name"), lambda d: d.get("name"), _n_token),
-        ("language", lambda s: s.get("language"), lambda d: d.get("language"), _n_token),
+        # language: Odoo sends {'id','name'}; compare on the name only
+        ("language", lambda s: _lang_name(s.get("language")),
+         lambda d: d.get("language"), _n_token),
         ("sub_type", lambda s: s.get("sub_type") or s.get("subType"),
-         lambda d: d.get("sub_type"), _n_token),
-        ("template_type", lambda s: s.get("template_type") or s.get("templateType"),
+         lambda d: d.get("sub_type"), _alias(_TEMPLATE_SUB_TYPE)),
+        # template_type: map the raw Odoo code to the Flask label via the loader's
+        # own rule before comparing (else 'online' != 'Live Consent Template' always)
+        ("template_type", _src_template_type,
          lambda d: d.get("template_type"), _n_token),
     ],
     "vendor": [
@@ -659,10 +834,18 @@ FIELD_MAPS = {
     ],
     "stakeholder": [
         ("name", lambda s: s.get("name"), lambda d: d.get("name"), _n_token),
-        ("email", lambda s: s.get("login") or s.get("email"), lambda d: d.get("email"), _n_token),
+        # email intentionally NOT compared: GET /auth/backend-users does not
+        # serialize email (PII), so the dest side is always None -> every row would
+        # false-diff. Source email keys stay in EXPLICIT_SRC_KEYS so they are not
+        # mislabelled "unchecked". Re-add a rule if the endpoint ever returns email.
     ],
     "processing_activity": [
         ("name", lambda s: s.get("name"), lambda d: d.get("name"), _n_token),
+        # Odoo 'yes'/'no' vs Flask True/False (nested under status) — same value.
+        ("is_active", lambda s: s.get("isActive"),
+         lambda d: (d.get("status") or {}).get("is_active"), _bool_norm),
+        ("show_on_dpgr", lambda s: s.get("showOnDpgr"),
+         lambda d: (d.get("status") or {}).get("show_on_dpgr"), _bool_norm),
     ],
 }
 
@@ -671,17 +854,40 @@ FIELD_MAPS = {
 # accounting doesn't double-count them as "unchecked".
 EXPLICIT_SRC_KEYS = {
     "consent": {"name", "eMail", "phone", "status", "paperType",
-                "legacyType", "userActivityType"},
-    "request": {"name", "eMail", "phone", "status"},
+                "legacyType", "userActivityType",
+                "sentOn", "deliveredOn", "validTill", "createdOn", "closedOn"},
+    "request": {"name", "eMail", "phone", "status", "createOn"},
     "template": {"name", "language", "sub_type", "subType",
                  "template_type", "templateType"},
     "vendor": {"company_name", "name", "status"},
     "stakeholder": {"name", "login", "email"},
-    "processing_activity": {"name"},
+    "processing_activity": {"name", "isActive", "showOnDpgr"},
 }
+
+# Fields Flask REGENERATES on insert (not migrated values), keyed by normalized
+# leaf name. Comparing them is a guaranteed false positive, same as the primary
+# id: e.g. request_no is freshly minted at load time (load-date prefix), so it can
+# never equal the Odoo source's request number. Excluded from the auto-pair pass.
+GENERATED_FIELDS = {
+    "request": {"requestno"},
+}
+
 
 def _is_list_mark(v):
     return isinstance(v, tuple) and len(v) == 2 and v[0] == "__list__"
+
+
+def _disp(v, width=24):
+    """One readable table cell. None/empty -> '-'; list marks -> '[N item(s)]';
+    long values truncated with an ellipsis so columns stay aligned."""
+    if v is None:
+        return "-"
+    if _is_list_mark(v):
+        return f"[{v[1]} item(s)]"
+    s = str(v).strip().replace("\n", " ")
+    if not s:
+        return "-"
+    return s if len(s) <= width else s[:width - 1] + "…"
 
 
 def _flatten(rec, prefix=""):
@@ -720,15 +926,18 @@ def _generic_norm(v):
 def compare_record(entity, src, dst):
     """Compare a source record against its dest record across EVERY field.
 
-    Returns (diffs, coverage):
+    Returns (diffs, coverage, rows):
       diffs    = [(field, src_norm, dst_norm), ...] for value mismatches
       coverage = {src_keys, dst_keys, compared_src, complex_src} flattened key sets
+      rows     = [(field, src_raw, dst_raw, ok), ...] EVERY compared field (match
+                 and mismatch alike) for the side-by-side per-record table
 
     Two passes: (1) explicit FIELD_MAPS for renamed/enum fields, (2) auto-pair
     every remaining source scalar to a dest scalar with the same normalized name.
     A field is only flagged when BOTH sides carry a value. Unpaired fields are
     reported in coverage, never silently ignored."""
     diffs = []
+    rows = []
     # (1) explicit renamed/enum maps
     for label, get_s, get_d, norm in FIELD_MAPS.get(entity, []):
         try:
@@ -737,7 +946,9 @@ def compare_record(entity, src, dst):
             continue
         if sv is None or (isinstance(sv, str) and not sv.strip()):
             continue
-        if norm(sv) != norm(dv):
+        ok = norm(sv) == norm(dv)
+        rows.append((label, sv, dv, ok))
+        if not ok:
             diffs.append((label, norm(sv), norm(dv)))
 
     # (2) auto-pair everything else by normalized leaf name
@@ -748,6 +959,16 @@ def compare_record(entity, src, dst):
     compared_src = set()
     for sk, sv in flat_src.items():
         base = sk.split(".")[-1]
+        # Identity columns are remapped by the migration (Odoo id != Flask id by
+        # design, validated via the source-map, not raw ids). Comparing them is a
+        # guaranteed false positive — and _flatten can surface a nested object's
+        # `id` on the dest side, producing nonsense like '488' != '1'. Skip any
+        # leaf whose normalized name is exactly the identity token.
+        if _n_token(base) == "id":
+            continue
+        # Flask-regenerated identifiers (request_no, ...) are not migrated data.
+        if _n_token(base) in GENERATED_FIELDS.get(entity, ()):
+            continue
         if base in explicit or sk in explicit:
             compared_src.add(sk)
             continue
@@ -759,13 +980,17 @@ def compare_record(entity, src, dst):
         if _is_list_mark(sv):
             if _is_list_mark(dv):
                 compared_src.add(sk)
-                if sv[1] != dv[1]:
+                ok = sv[1] == dv[1]
+                rows.append((f"{base}[len]", sv, dv, ok))
+                if not ok:
                     diffs.append((f"{base}[len]", str(sv[1]), str(dv[1])))
             continue
         if sv is None or (isinstance(sv, str) and not sv.strip()) or _is_list_mark(dv):
             continue
         compared_src.add(sk)
-        if _generic_norm(sv) != _generic_norm(dv):
+        ok = _generic_norm(sv) == _generic_norm(dv)
+        rows.append((base, sv, dv, ok))
+        if not ok:
             diffs.append((base, _generic_norm(sv), _generic_norm(dv)))
 
     coverage = {
@@ -776,7 +1001,7 @@ def compare_record(entity, src, dst):
         "complex_src": {k for k, v in flat_src.items()
                         if _is_list_mark(v) and k not in compared_src},
     }
-    return diffs, coverage
+    return diffs, coverage, rows
 
 
 def run_field_diff(entity, sm_pairs):
@@ -811,7 +1036,7 @@ def run_field_diff(entity, sm_pairs):
             if dst is None:
                 continue  # absence is DRIFT's job, not the field diff's
             compared += 1
-            diffs, cov = compare_record(entity, src, dst)
+            diffs, cov, rows = compare_record(entity, src, dst)
             all_src |= cov["src_keys"]
             all_dst |= cov["dst_keys"]
             checked_src |= cov["compared_src"]
@@ -820,8 +1045,10 @@ def run_field_diff(entity, sm_pairs):
                 mism_records += 1
                 for label, ns, nd in diffs:
                     field_counts[label] += 1
-                if len(samples) < 10:
-                    samples.append((str(odoo_id), str(fid), diffs))
+                # keep the FULL per-field rows (match + mismatch) so the report can
+                # render a side-by-side table, not just the diff one-liners.
+                if len(samples) < 25:
+                    samples.append((str(odoo_id), str(fid), rows, len(diffs)))
     unchecked_src = sorted(all_src - checked_src - complex_src)
     return {
         "compared": compared,
@@ -895,6 +1122,14 @@ class EntityResult:
     field_diff: Optional[dict] = None      # per-field value-equality summary (--live)
 
     @property
+    def live_unverified(self) -> bool:
+        """LIVE run, this entity has a Flask list endpoint, yet the live read came
+        back empty (None) -> auth 401 / app down. Content was NOT verified, so a
+        count-only 'PASS' would be a lie. Drives the UNVERIFIED verdict + banner."""
+        return (LIVE and self.spec.key in FLASK_LIST_ENDPOINTS
+                and self.live_dest_ids is None)
+
+    @property
     def drift(self) -> int:
         return len(self.drift_ids) if self.drift_ids else 0
 
@@ -953,7 +1188,10 @@ class EntityResult:
         if self.source is None or self.migrated is None:
             return "UNKNOWN"
         if self.migrated == self.source:
-            return "PASS"
+            # counts match -- but in LIVE mode a match is only a real PASS if the
+            # content was actually verified against the app. A dead token must not
+            # masquerade as clean: downgrade to UNVERIFIED.
+            return "UNVERIFIED" if self.live_unverified else "PASS"
         if (self.unexplained or 0) > 0:
             return "GAP"                      # records vanished unexplained
         if self.unaccepted_failed == 0:
@@ -993,7 +1231,7 @@ def build_results() -> list[EntityResult]:
             lambda: count_csv_rows(f"{RAW_DIR}/raw_requests.csv"),
             "raw_requests.csv",
             [("processed", f"{PROC_DIR}/processed_requests.csv")],
-            "request", None, "requests",
+            "request", f"{PROC_DIR}/errors_processed_requests.csv", "requests",
             raw_ids_fn=lambda: csv_ids(f"{RAW_DIR}/raw_requests.csv"),
         ),
         EntitySpec(
@@ -1057,9 +1295,12 @@ def build_results() -> list[EntityResult]:
         live_source = drift_ids = present = field_diff = None
         source = s.source_fn()
         if LIVE:
-            live_source = live_source_count(s.key)
-            if live_source is not None:
-                source = live_source             # live Odoo wins over the snapshot
+            # cached-source: keep the offline raw-file count (source above); only a
+            # true live run re-counts from Odoo. DEST is always read live.
+            if not CACHED_SOURCE:
+                live_source = live_source_count(s.key)
+                if live_source is not None:
+                    source = live_source         # live Odoo wins over the snapshot
             present = live_dest_ids(s.key)       # flask ids actually in the live app
             if present is not None and s.sourcemap_key:
                 ledger_fids = set()              # flatten fan-out sets
@@ -1105,8 +1346,33 @@ def _fmt(n: Optional[int]) -> str:
 
 VERDICT_GLYPH = {
     "PASS": "+", "PASS*": "+", "RECOVERABLE": "~", "GAP": "x", "DRIFT": "!",
-    "UNTRACKED": "?", "UNKNOWN": "?",
+    "UNVERIFIED": "?", "UNTRACKED": "?", "UNKNOWN": "?",
 }
+
+
+def _compare_table(title: str, sample) -> list[str]:
+    """Render one migrated record as an aligned source-vs-flask field table.
+    `sample` = (odoo_id, flask_id, rows, n_diff); rows = [(field, src, dst, ok)].
+    Every compared field is shown (OK and DIFF) so a match is as visible as a
+    mismatch. The Flask `id` never appears here — it is regenerated by Flask and
+    is intentionally excluded from the comparison."""
+    oid, fid, rows, ndiff = sample
+    FW, SW, DW = 16, 26, 26  # column caps
+    fw = min(FW, max([len("field")] + [len(str(lbl)) for lbl, *_ in rows]))
+    sw = min(SW, max([len("source")] + [len(_disp(s, SW)) for _, s, _, _ in rows]))
+    dw = min(DW, max([len("flask")] + [len(_disp(d, DW)) for _, _, d, _ in rows]))
+    out = [
+        f"        ┌─ {title}  odoo#{oid} → flask#{fid}   ({ndiff} field(s) differ)",
+        f"          {'field':<{fw}} │ {'source':<{sw}} │ {'flask':<{dw}} │",
+        f"          {'─'*fw}─┼─{'─'*sw}─┼─{'─'*dw}─┼──────",
+    ]
+    for lbl, s, d, ok in rows:
+        mark = "OK  " if ok else "DIFF"
+        out.append(
+            f"          {str(lbl)[:fw]:<{fw}} │ {_disp(s, sw):<{sw}} │ "
+            f"{_disp(d, dw):<{dw}} │ {mark}"
+        )
+    return out
 
 
 def render(results: list[EntityResult]) -> str:
@@ -1116,9 +1382,28 @@ def render(results: list[EntityResult]) -> str:
     L.append("  ODOO -> FLASK MIGRATION : RECONCILIATION AUDIT".ljust(78))
     L.append(f"  generated {datetime.now():%Y-%m-%d %H:%M:%S}  |  source-map = live Postgres truth")
     if LIVE:
-        L.append("  mode: LIVE  |  SOURCE=live Odoo  |  MIGRATED verified against live Flask app")
+        if CACHED_SOURCE:
+            L.append("  mode: LIVE  |  SOURCE=raw snapshot (cached, no Odoo re-pull)  |  "
+                     "MIGRATED verified against live Flask app")
+        else:
+            L.append("  mode: LIVE  |  SOURCE=live Odoo  |  MIGRATED verified against live Flask app")
     L.append(line)
     L.append("")
+
+    # ---- live-verify failure banner (loud: a dead token must not look clean) ----
+    if LIVE:
+        unverified = [r.spec.title for r in results if r.live_unverified]
+        if unverified:
+            bang = "!" * 78
+            L.append(bang)
+            L.append("  !! LIVE VERIFY FAILED -- the Flask app returned NO data for the")
+            L.append("     entit(ies) below (auth 401 / app down). Counts come from the")
+            L.append("     ledger, but CONTENT WAS NOT VERIFIED: field check and DRIFT")
+            L.append("     detection were SKIPPED. A count-match here is NOT a real PASS.")
+            L.append(f"     affected : {', '.join(unverified)}")
+            L.append("     fix      : refresh FLASK_API_KEY in config/.env, then rerun --live")
+            L.append(bang)
+            L.append("")
 
     # ---- summary table ----
     L.append("SUMMARY  (migrated / source)")
@@ -1145,7 +1430,7 @@ def render(results: list[EntityResult]) -> str:
     L.append("  legend: src=Odoo source  migr=landed in Flask  fail=rejected  "
              "acc=accepted-loss  unexp=unexplained")
     L.append("          OK pass | OK* covered by accepted-loss | FIX recoverable "
-             "(operational) | GAP investigate | ?? not tracked")
+             "(operational) | GAP investigate | ?? unverified/not tracked")
     L.append("")
 
     # ---- per-entity detail ----
@@ -1202,9 +1487,14 @@ def render(results: list[EntityResult]) -> str:
                          f"source vs live app:")
                 for label, n in fd["field_counts"].most_common():
                     L.append(f"           - {n:>4} x  field '{label}' mismatched")
-                for oid, fid, diffs in fd["samples"][:5]:
-                    parts = "; ".join(f"{lbl}: '{s}' != '{d}'" for lbl, s, d in diffs)
-                    L.append(f"           e.g. odoo#{oid}->flask#{fid}: {parts}")
+                shown = fd["samples"][:15]
+                L.append("")
+                L.append(f"        side-by-side field comparison "
+                         f"(showing {len(shown)} of {fd['records_mismatched']} "
+                         f"differing record(s); Flask id excluded by design):")
+                for sample in shown:
+                    L.extend(_compare_table(r.spec.title, sample))
+                    L.append("")
             else:
                 L.append("        all value-checked fields match")
         if r.failed:
@@ -1234,6 +1524,64 @@ def render(results: list[EntityResult]) -> str:
         L.append(f"  {i}. [{item['sev']}] {item['title']}")
         L.append(f"        {item['detail']}")
 
+    # ---- relationship integrity (vendor <-> request) ----
+    # The vendor<->request link IS sourced: /dpgr/id `assignToVendor` (captured by
+    # run_request_enrichment, migrated as assigned_vendor_source_ids). So link
+    # rows are EXPECTED, not anomalous. Compare the live assoc-table count against
+    # the number of source requests that actually carry an assignToVendor.
+    L.append("")
+    L.append("=" * 78)
+    L.append("RELATIONSHIP INTEGRITY : Vendor <-> Request")
+    L.append("=" * 78)
+
+    def _count(tbl):
+        out = _psql(f"SELECT count(*) FROM {tbl};")
+        try:
+            return int((out or "").strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _source_vendor_links() -> Optional[int]:
+        """Requests whose enriched raw row carries a non-empty assignToVendor."""
+        path = f"{RAW_DIR}/raw_requests.csv"
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            return None
+        if not rows or "assignToVendor" not in rows[0]:
+            return None
+        n = 0
+        for r in rows:
+            v = (r.get("assignToVendor") or "").strip()
+            if v and v not in ("[]", "{}", "null", "None"):
+                n += 1
+        return n
+
+    va = _count("vendor_activities")
+    rav = _count("request_assigned_vendor")
+    src_links = _source_vendor_links()
+    if va is None or rav is None:
+        L.append("  vendor<->request: UNKNOWN (could not read link tables)")
+    elif src_links is None:
+        L.append(f"  vendor<->request: enrich requests first (no assignToVendor column)")
+        L.append(f"    live link rows: vendor_activities={va}, request_assigned_vendor={rav}")
+    elif src_links == 0 and rav == 0:
+        L.append("  vendor<->request: N/A (no source linkage in this dataset)")
+        L.append("    No request in raw_requests.csv carries an assignToVendor, and the")
+        L.append("    request_assigned_vendor link table is empty -> CORRECT, not loss.")
+    elif rav >= src_links:
+        L.append(f"  vendor<->request: OK ({rav} link rows >= {src_links} source links)")
+        L.append(f"    Source assignToVendor links: {src_links}; live "
+                 f"request_assigned_vendor={rav}, vendor_activities={va}.")
+    else:
+        L.append(f"  vendor<->request: GAP -- {src_links} source links but only "
+                 f"{rav} request_assigned_vendor rows")
+        L.append("    Some assignToVendor links did not land. Confirm vendors migrated")
+        L.append("    before requests and that /migration/request resolves the vendor map.")
+
     # ---- methodology ----
     L.append("")
     L.append("=" * 78)
@@ -1244,6 +1592,18 @@ def render(results: list[EntityResult]) -> str:
     L.append("    All six entities are now tracked; template maps one source to many")
     L.append("    Flask rows (distinct sub_key each), so its migrated count is distinct")
     L.append("    sources, not emitted rows.")
+    L.append("  - field check (--live): every mapped field is compared source vs live")
+    L.append("    Flask, EXCEPT Flask-regenerated identifiers -- the primary id and")
+    L.append("    request_no (minted fresh at load, matched via the source-map instead).")
+    L.append("    template_type/language are mapped to the Flask label before comparing")
+    L.append("    (raw Odoo codes would always diff); stakeholder email is skipped (the")
+    L.append("    /auth/backend-users endpoint does not return it). Dates compare as UTC --")
+    L.append("    Flask API serializes IST (+05:30), normalized back to UTC first, so an")
+    L.append("    evening-UTC row does not falsely diff. consent dates checked: sent_on,")
+    L.append("    delivery_on, valid_till, created_at, closed_on. request: created_at only")
+    L.append("    (closed_on / action_date are not in /request/open-request -> excluded to")
+    L.append("    avoid false positives). A field is flagged only when BOTH sides have a")
+    L.append("    value; unpaired fields are listed under 'unchecked source fields'.")
     L.append("  - 'failed' counts come from data/processed/errors_*.csv (latest load run).")
     L.append("  - 'accepted loss' is the operator-maintained data/accepted_loss.json.")
     L.append("  - Any read failure renders as n/a rather than aborting the audit.")
@@ -1255,6 +1615,17 @@ def derive_requirements(results: list[EntityResult]) -> list[dict]:
     """Turn the numbers into a ranked action list (the 'what's left' section)."""
     reqs: list[dict] = []
     by_key = {r.spec.key: r for r in results}
+
+    unverified = [r.spec.title for r in results if r.live_unverified]
+    if unverified:
+        reqs.append({
+            "sev": "HIGH",
+            "title": f"Restore live verification ({len(unverified)} entit(ies) UNVERIFIED)",
+            "detail": "The Flask app returned no data (auth 401 / down), so field check + "
+                      "DRIFT detection were skipped and count-matches are NOT confirmed "
+                      f"content. Affected: {', '.join(unverified)}. Refresh FLASK_API_KEY "
+                      "in config/.env and rerun --live before trusting any PASS.",
+        })
 
     c = by_key.get("consent")
     if c and c.failed:
@@ -1379,6 +1750,11 @@ if __name__ == "__main__":
         if not (FLASK_API_BASE_URL and FLASK_API_KEY):
             print("WARN: --live set but FLASK_API_BASE_URL / FLASK_API_KEY missing; "
                   "dest verification will read n/a.", file=sys.stderr)
+    if "--cached-source" in sys.argv:
+        CACHED_SOURCE = True
+        if not LIVE:
+            print("NOTE: --cached-source only affects --live runs (offline already "
+                  "reads the raw snapshot).", file=sys.stderr)
     if "--self-test" in sys.argv:
         problems = self_test()
         print("SELF-TEST:", "PASS" if not problems else "FAIL")
