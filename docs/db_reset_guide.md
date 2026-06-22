@@ -93,30 +93,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_tenants_frontend_domain ON tenants (fronten
 
 ## Step 4 — Insert Required Seed Data
 
-The migration scripts require three things that are **not** created automatically by the Flask app:
+The migration needs licenses + a role alias that are **not** created automatically.
 
-1. A **DPCM license** (for consent loading)
-2. A **DPGR license** (for request loading)
-3. A **request type** (for DPGR requests)
+> **CRITICAL — use the REAL tenant id.** Get it from Step 3:
+> `SELECT id, tenant_name, frontend_domain FROM tenants;`
+> The API key / `FLASK_TENANT_DOMAIN` resolves to ONE tenant (here `1` = SK Finance).
+> Seed licenses for THAT id. Seeding the wrong tenant (the old guide hardcoded
+> `2`, which may not exist) leaves the `licenses` table effectively empty for the
+> tenant being loaded → every load fails with `No active license available for
+> module '...' (tenant_id=N)`. Substitute the real id for `1` below.
 
-Run all three inserts in one go. Get the tenant ID from Step 3 (usually `2`) and substitute if different.
+**4a. Licenses — seed ALL modules the migration touches** (DPCM=consent,
+DPGR=request, **DPTPA=vendor**; the rest are harmless future-proofing). Large
+seat count because `consume_license` takes a seat per NEW data principal.
 
 ```bash
 PGPASSWORD=yashaswi123 psql -U yashaswi -h localhost -d privacium_db -c "
--- DPCM license: required for consent (live-consent and import endpoints)
 INSERT INTO licenses (tenant_id, license_type_id, total_users, used_users, active, expires_at, expires_users)
-SELECT 2, id, 1000, 0, true, '2027-12-31', 0
-FROM license_types WHERE code = 'DPCM'
-ON CONFLICT DO NOTHING;
+SELECT 1, id, 100000, 0, true, '2030-12-31', 0
+FROM license_types WHERE code IN ('DPCM','DPGR','DPTPA','DPAP','DPIA','DDMT');
+"
+```
 
--- DPGR license: required for request creation
-INSERT INTO licenses (tenant_id, license_type_id, total_users, used_users, active, expires_at, expires_users)
-SELECT 2, id, 1000, 0, true, '2027-12-31', 0
-FROM license_types WHERE code = 'DPGR'
-ON CONFLICT DO NOTHING;
+**4b. Request type** (skip if the tenant already has request types — check with
+`SELECT count(*) FROM request_types WHERE tenant_id = 1;`):
 
--- Request type: required for DPGR request loading
--- The global unique index on name prevents duplicates; skip if already present
+```bash
+PGPASSWORD=yashaswi123 psql -U yashaswi -h localhost -d privacium_db -c "
 INSERT INTO request_types (
     name, tenant_id,
     sla_expected_days, sla_amber_notification_days, sla_red_notification_days,
@@ -125,14 +128,22 @@ INSERT INTO request_types (
     consent_withdrawal_check, is_revoke
 )
 VALUES (
-    'Right to grievance redressal (DPDP)', 2,
-    30, 25, 28,
-    25, 28,
-    false, false, false, true,
-    true, false
+    'Right to grievance redressal (DPDP)', 1,
+    30, 25, 28, 25, 28,
+    false, false, false, true, true, false
 )
 ON CONFLICT (name) DO NOTHING;
 "
+```
+
+**4c. Stakeholder role alias** — Odoo roles (`PA Manager`, `DPO`) must map onto a
+role that actually exists in the tenant (a fresh DB has only e.g. `PA Manager
+Full Access`). Without this, `stakeholder load` fails every row with `Role(s) not
+found in Flask`. Create `data/stakeholder_role_aliases.json` (values must match a
+real Flask role name; lookup is case-insensitive):
+
+```json
+{ "PA Manager": "PA Manager Full Access", "DPO": "PA Manager Full Access" }
 ```
 
 ---
@@ -148,6 +159,9 @@ ALTER TABLE requests ADD COLUMN IF NOT EXISTS odoo_source_id INTEGER;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_odoo_source_tenant
     ON requests (tenant_id, odoo_source_id)
     WHERE odoo_source_id IS NOT NULL;
+-- Stores the Odoo actionDate (with time-of-day); not a core Request column, so
+-- /migration/request writes it via raw SQL. Without this column action_date is skipped.
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS action_date timestamp;
 "
 ```
 
@@ -205,25 +219,59 @@ If you see `"Invalid tenant domain: dpdpconsultants.com"`, the tenant row is mis
 
 ---
 
-## Step 8 — Run the Migration
+## Step 8 — Run the Migration (ORDER MATTERS)
+
+Load entities in this exact order. The order resolves a circular dependency
+between Processing Activities and Templates:
+
+- a **Template** links to PAs (`processing_activity_ids`), so it needs PAs to
+  exist first;
+- a **PA** links back to templates (`consent_email_template_id`, ...), so it
+  needs templates to exist first.
+
+Break the cycle by loading **PA first (its template refs stay null, logged as
+warnings), then templates (their PA ids now resolve and the link is set at
+create time), then `processing-activity patch-links` to backfill the template
+refs onto the PAs.** Loading templates before PAs is what leaves every migrated
+template with **zero** processing activities — do not do it.
 
 ```bash
-cd /home/yashaswi/Developer/migration
+cd /home/yashaswi/Developer/migrations_odoo_flask/migration
 source venv/bin/activate
 
-# Requests (65 records)
-python main.py request load
+# 1. Stakeholders first — PA managers are backend users.
+python main.py stakeholder load
 
-# Consents: deemed batch (Excel upload) + live (per-record JSON)
+# 2. Processing Activities — template refs are skipped now (warns), patched in 4.
+python main.py processing-activity load
+
+# 3. Templates — PAs now exist, so processing_activity_ids resolve and the
+#    request<->PA link is set at create time. Then activate them.
+python main.py template load
+python main.py template approve     # or: template load-approve
+
+# 4. Backfill the template refs onto the PAs created in step 2.
+python main.py processing-activity patch-links
+
+# 5. Vendors — resolve their department to a PA (needs PAs from step 2).
+python main.py vendor load
+
+# 6. Request types, then consents, then requests (requests need consents+vendors).
+python main.py request-type load
 python main.py consent load
+python main.py request load
 ```
 
-Expected final lines:
+After loading, verify with the reconcile audit (see Step 9 / `python -m
+scripts.report.reconcile --live`): templates should now show their processing
+activities, and requests their PA links.
+
+Expected final lines (counts vary by dataset):
 
 ```
-Summary: 65 succeeded, 0 failed.
+Summary: 71 succeeded, 0 failed.
 ...
-Live consent complete: 363 succeeded, 0 failed.
+Live consent complete: 467 succeeded, 0 failed.
 ```
 
 ---
