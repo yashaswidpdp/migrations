@@ -66,7 +66,7 @@ class FlaskLoader:
                     f"source-map record failed {entity} {odoo_id}->{flask_id}: "
                     f"{resp.status_code} {resp.text[:200]}"
                 )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError): 
             logger.warning(f"source-map skip {entity}: bad ids {odoo_id}->{flask_id}")
         except Exception as e:
             logger.warning(f"source-map record exception {entity} {odoo_id}: {e}")
@@ -77,7 +77,13 @@ class FlaskLoader:
             logger.error(f"Input CSV not found: {input_path}")
             return
 
-        df = pd.read_csv(input_path)
+        # Force `phone` to read as string. pandas otherwise infers the column as
+        # float64 whenever blanks are present, turning '9878987819' into the float
+        # 9878987819.0; the row-level NaN->None guard below only nulls true NaNs,
+        # so a non-blank phone would reach the API as '9878987819.0' (the trailing
+        # '.0' then lands in Flask). dtype=str preserves the exact digits (and any
+        # leading zero); pandas ignores the key for CSVs that have no phone column.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         logger.info(f"Loaded {len(df)} records from {csv_filename}")
 
         success_count = 0
@@ -208,7 +214,9 @@ class FlaskLoader:
         if not os.path.exists(input_path):
             logger.error(f"Vendor CSV not found: {input_path}")
             return
-        df = pd.read_csv(input_path)
+        # phone as string — see load_from_csv: avoids the float '...0' artifact a
+        # blank-bearing phone column otherwise gets, which would land in Flask.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         logger.info(f"Loaded {len(df)} vendor records from {csv_filename}")
 
         pa_map = self._resolve_pa_ids()
@@ -260,7 +268,7 @@ class FlaskLoader:
                     skipped += 1
                 else:
                     # Real failure — incl. "Vendor already exists for user"
-                    # (a different Odoo vendor sharing this contact user). Surface
+                    # (a different Odoo vendor sharing this contact user). Surface  
                     # it, never silently count as success.
                     logger.error(f"Failed vendor '{data.get('company_name')}': {resp.status_code} - {resp.text[:300]}")
                     failure_rows.append({**data, "error_message": resp.text, "status_code": resp.status_code})
@@ -336,22 +344,34 @@ class FlaskLoader:
     def _resolve_request_type_map(self) -> dict:
         """Map every Flask request type name (lower-cased) -> id, so an enriched
         Odoo `requestType` name resolves to the right id instead of a hardcoded
-        default. Mirrors the PA / template name->id resolution."""
+        default. Mirrors the PA / template name->id resolution.
+
+        GET /request-types/ paginates (default 10/page, max 100), so page through
+        ALL pages — a single call only sees the first page and silently drops
+        types whose names live further down (e.g. lowest ids under id-desc sort)."""
         name_to_id = {}
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/request-types/",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
+            while True:
+                response = requests.get(
+                    f"{self.base_url}/request-types/",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 100},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
                 body = response.json()
                 data = body.get("data", {})
                 records = data.get("records", []) if isinstance(data, dict) else data
-                if isinstance(records, list):
-                    for r in records:
-                        if isinstance(r, dict) and "name" in r and "id" in r:
-                            name_to_id[str(r["name"]).strip().lower()] = r["id"]
+                if not isinstance(records, list) or not records:
+                    break
+                for r in records:
+                    if isinstance(r, dict) and "name" in r and "id" in r:
+                        name_to_id[str(r["name"]).strip().lower()] = r["id"]
+                if len(records) < 100:
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not build request-type name map: {e}")
         return name_to_id
@@ -402,6 +422,47 @@ class FlaskLoader:
                 logger.error(f"Exception creating request type '{name}': {e}")
                 failed += 1
         logger.info(f"Request-type seed summary: {created} created, {skipped} skipped, {failed} failed.")
+
+    def load_request_types(self, json_file: str = "processed_request_types.json"):
+        """Load transformed Odoo request types (data/processed) into Flask via
+        POST /request-types/create. Idempotent: skips any name already present.
+        Must run before consent + request loads so request_type_name resolves."""
+        path = os.path.join(DATA_PROCESSED_DIR, json_file)
+        if not os.path.exists(path):
+            logger.error(f"Processed request-type file not found: {path}")
+            return
+        with open(path, encoding="utf-8") as f:
+            payloads = json.load(f)
+
+        existing = self._resolve_request_type_map()  # name(lower) -> id
+        created = skipped = failed = 0
+        for p in payloads:
+            name = str(p.get("name", "")).strip()
+            if not name:
+                continue
+            if name.lower() in existing:
+                logger.info(f"Request type '{name}' already exists (id={existing[name.lower()]}). Skipping.")
+                skipped += 1
+                continue
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/request-types/create",
+                    headers=self.headers,
+                    json=p,
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    logger.info(f"Created request type '{name}'.")
+                    created += 1
+                elif resp.status_code == 400 and "already exists" in resp.text:
+                    skipped += 1
+                else:
+                    logger.error(f"Failed to create request type '{name}': {resp.status_code} - {resp.text}")
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception creating request type '{name}': {e}")
+                failed += 1
+        logger.info(f"Request-type load summary: {created} created, {skipped} skipped, {failed} failed.")
 
     def _resolve_user_ids(self) -> dict:
         """Fetch all backend users from Flask and map their names to user IDs."""
@@ -509,6 +570,12 @@ class FlaskLoader:
             if name in name_to_id:
                 logger.info(f"PA '{name}' already exists (id={name_to_id[name]}). Skipping.")
                 skip_count += 1
+                # Backfill the ledger for an already-loaded PA (mirrors the
+                # template loader) so a re-run records previously-loaded rows
+                # the up-front _resolve_pa_ids() map would otherwise early-skip.
+                self._record_source_map(
+                    "processing_activity", row.get("odoo_id"), name_to_id[name]
+                )
                 continue
 
             parent_name = row.get("parent_name")
@@ -839,6 +906,84 @@ class FlaskLoader:
         )
         return created_ids
 
+    def patch_template_pa_links(self, csv_filename: str = "processed_templates.csv"):
+        """Backfill processing-activity links onto templates ALREADY in Flask.
+
+        Re-runnable. The create pass only links PAs if pa_map was complete at
+        create time; templates created earlier (incomplete pa_map / before PAs)
+        end up with no PA link. This re-resolves the names against the full pa_map
+        and PUTs `processing_activity_ids` onto each existing template. Idempotent
+        (PUT replaces the M2M). Skips DEFAULT templates (they cannot carry PAs).
+        Requires the PUT plural-key fix in notice_template/crud.py."""
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"CSV not found: {input_path}")
+            return 0
+
+        df = pd.read_csv(input_path)
+        df = df.where(pd.notnull(df), None)
+        name_to_id = self._fetch_template_id_map()   # paginated, full
+        pa_map = self._resolve_pa_ids()              # paginated + full endpoint
+        logger.info(
+            f"patch_template_pa_links: {len(name_to_id)} templates, {len(pa_map)} PAs resolved."
+        )
+
+        patched = skipped = failed = 0
+        for _, row in df.iterrows():
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            if bool(row.get("is_default", False)):
+                skipped += 1                          # default templates carry no PA
+                continue
+
+            pa_names_str = row.get("processing_activity_names")
+            if not pa_names_str:
+                skipped += 1
+                continue
+            try:
+                if isinstance(pa_names_str, str) and pa_names_str.startswith("["):
+                    pa_names = ast.literal_eval(pa_names_str)
+                elif isinstance(pa_names_str, str):
+                    pa_names = [pa_names_str]
+                else:
+                    pa_names = list(pa_names_str)
+            except Exception:
+                pa_names = []
+            pa_ids = [pa_map[n.strip()] for n in pa_names if str(n).strip() in pa_map]
+            if not pa_ids:
+                skipped += 1
+                continue
+
+            tid = name_to_id.get(name)
+            if not tid:
+                logger.warning(f"patch_template_pa_links: template '{name}' not in Flask; skipping.")
+                failed += 1
+                continue
+            try:
+                resp = requests.put(
+                    f"{self.base_url}/notice-templates/{tid}",
+                    headers=self.headers,
+                    json={"processing_activity_ids": pa_ids},
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    patched += 1
+                else:
+                    logger.error(
+                        f"patch_template_pa_links '{name}' (id={tid}): "
+                        f"{resp.status_code} - {resp.text[:200]}"
+                    )
+                    failed += 1
+            except Exception as e:
+                logger.error(f"patch_template_pa_links '{name}': {e}")
+                failed += 1
+
+        logger.info(
+            f"Template PA-link patch: {patched} patched, {skipped} skipped, {failed} failed."
+        )
+        return patched
+
     def approve_templates(self, csv_filename: str, id_map: dict = None):
         """Activate templates that were loaded as Draft.
 
@@ -966,29 +1111,43 @@ class FlaskLoader:
         return set()
 
     def _resolve_pa_ids(self) -> dict:
+        """name -> Flask PA id, across ALL pages. The endpoint paginates (50/page),
+        so reading only page 1 silently drops PAs on later pages -> every consent /
+        template / request that references a missing PA fails 'PA not found' or
+        loses its PA link. Walk every page using the pagination meta."""
+        # Use the FULL /processing/activities endpoint, not /simple: /simple omits
+        # INACTIVE PAs, but historical consents/requests still reference them (e.g.
+        # a deactivated 'Testing' activity) and must resolve. Walk every page.
+        out: dict = {}
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/processing/activities/simple",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
-                body = response.json()
-                data = body.get("data", {})
-                records = []
+            while page <= 1000:                      # hard cap; bad pager can't loop forever
+                response = requests.get(
+                    f"{self.base_url}/processing/activities",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 100},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
+                data = response.json().get("data", {})
                 if isinstance(data, dict):
                     records = data.get("records", [])
-                elif isinstance(data, list):
-                    records = data
-                if isinstance(records, list):
-                    return {
-                        pa["name"]: pa["id"]
-                        for pa in records
-                        if isinstance(pa, dict) and "name" in pa and "id" in pa
-                    }
+                    pag = data.get("pagination", {}) or {}
+                else:
+                    records = data if isinstance(data, list) else []
+                    pag = {}
+                for pa in records:
+                    if isinstance(pa, dict) and "name" in pa and "id" in pa:
+                        out[pa["name"]] = pa["id"]
+                total_pages = pag.get("totalPages")
+                has_next = pag.get("hasNext")
+                if not records or has_next is False or (total_pages and page >= int(total_pages)):
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not fetch PA list from Flask API: {e}")
-        return {}
+        return out
 
     # Map a ProcessingTypeEnum *value* to the enum *member name* the Flask
     # importer's parse_form_data() looks up (ProcessingTypeEnum[NAME.upper()]).
@@ -1359,6 +1518,10 @@ def run_request_type_seeding(seed_file: str = "request_types_seed.json"):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).seed_request_types(seed_file)
 
 
+def run_request_type_loading(json_file: str = "processed_request_types.json"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_request_types(json_file)
+
+
 def run_legacy_loading(csv_filename: str):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_legacy_via_import(csv_filename)
 
@@ -1393,6 +1556,10 @@ def run_template_load_and_approve(csv_filename: str):
     loader = FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY)
     created_ids = loader.load_templates(csv_filename)
     loader.approve_templates(csv_filename, id_map=created_ids)
+
+
+def run_template_pa_link_patch(csv_filename: str = "processed_templates.csv"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).patch_template_pa_links(csv_filename)
 
 
 def run_vendor_loading(csv_filename: str = "processed_vendors.csv"):
