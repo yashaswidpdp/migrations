@@ -179,8 +179,18 @@ def transform_vendor_data(input_filename: str = "raw_vendors.json",
             "phone": _clean(v.get("vendor_contact")),
             "website": _clean(v.get("vendor_website_url")),
             "contract_start": to_iso_datetime(v.get("date_of_rollout")),
-            # Odoo last_overall_risk -> risk_level; '' => NULL in Flask.
-            "risk_level": map_vendor_risk(v.get("last_overall_risk")),
+            # Time-preserving audit timestamps (full datetime, not date-only).
+            # Backend /migration/vendor maps these to created/updated columns;
+            # harmlessly ignored if it doesn't read them.
+            "last_updated_on": to_iso_datetime(v.get("last_updated_on")),
+            "submission_date": to_iso_datetime(v.get("submission_date")),
+            # Odoo last_overall_risk -> risk_level; '' => NULL in Flask. Fall back
+            # to the DM's assessment (last_overall_risk_dm) when the overall is
+            # unset, so vendors risk-rated only by the DM don't land NULL.
+            "risk_level": (
+                map_vendor_risk(v.get("last_overall_risk"))
+                or map_vendor_risk(v.get("last_overall_risk_dm"))
+            ),
             # Odoo state -> vra_status. status has no Odoo source -> Active.
             "vra_status": map_vendor_vra(v.get("state")),
             "status": "Active",
