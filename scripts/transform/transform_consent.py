@@ -72,7 +72,11 @@ def parse_tuple_string(tuple_str) -> list:
 def format_consent_date(raw) -> str:
     """Normalise an Odoo timestamp to the dd/mm/YYYY string the Flask paper
     importer expects (it parses with strptime "%d/%m/%Y"). Returns "" when
-    unparseable so the importer falls back to its own default."""
+    unparseable so the importer falls back to its own default.
+
+    NOTE: only the DEAD /consent/import paper/legacy paths consume dd/mm/YYYY.
+    The active /migration/consent path uses format_consent_datetime below, which
+    preserves the time-of-day (G1). Kept for those legacy paths only."""
     if raw is None or pd.isna(raw):
         return ""
     s = str(raw).strip()
@@ -90,13 +94,37 @@ def format_consent_date(raw) -> str:
         return ""
 
 
+def format_consent_datetime(raw) -> str:
+    """G1: preserve the full Odoo timestamp (date AND time-of-day) as
+    '%Y-%m-%d %H:%M:%S', the format the /migration/consent route's _parse_date
+    accepts. Truncating to a date (format_consent_date) drops HH:MM:SS and pins
+    every consent to midnight, losing intra-day chronology. Returns "" when
+    unparseable/blank so the route stores no value (no fabrication)."""
+    if raw is None or pd.isna(raw):
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return pd.to_datetime(s, format=fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+    try:
+        return pd.to_datetime(s).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
 def transform_consent_data(input_filename: str, output_filename: str):
     input_path = os.path.join(DATA_RAW_DIR, input_filename)
     if not os.path.exists(input_path):
         logger.error(f"Input file not found: {input_path}")
         return
 
-    df = pd.read_csv(input_path)
+    # phone as string — avoid pandas float inference dropping leading zeros /
+    # adding a '.0'; pandas ignores the key for CSVs without a phone column.
+    df = pd.read_csv(input_path, dtype={"phone": str})
     logger.info(f"Loaded {len(df)} records for transformation.")
 
     transformed_records = []
@@ -114,10 +142,11 @@ def transform_consent_data(input_filename: str, output_filename: str):
             manager_name = manager_field[1] if len(manager_field) > 1 else None
 
             # Consent date: prefer sentOn (when the notice/consent was recorded),
-            # fall back to deliveredOn. Only the Flask PAPER importer keeps this.
-            consent_date = format_consent_date(row.get("sentOn"))
+            # fall back to deliveredOn. Feeds consented_on on the migration route.
+            # G1: keep the time-of-day.
+            consent_date = format_consent_datetime(row.get("sentOn"))
             if not consent_date:
-                consent_date = format_consent_date(row.get("deliveredOn"))
+                consent_date = format_consent_datetime(row.get("deliveredOn"))
 
             record = {
                 "odoo_source_id": row.get("id"),
@@ -135,16 +164,17 @@ def transform_consent_data(input_filename: str, output_filename: str):
                 "consentType": map_consent_type(row.get("paperType", "digital")),
                 "processingType": map_processing_type(row.get("userActivityType", "mandatory")),
                 "consent_date": consent_date,
-                # Odoo source dates -> Flask Consent columns. dd/mm/YYYY matches
-                # the importer's strptime format; "" lets the backend default.
-                "sent_on": format_consent_date(row.get("sentOn")),
-                "delivered_on": format_consent_date(row.get("deliveredOn")),
-                "valid_till": format_consent_date(row.get("validTill")),
-                "consent_reject_on": format_consent_date(row.get("consentRejectOn")),
-                # Audit timestamps -> created_at / last_updated / closed_on.
-                "created_on": format_consent_date(row.get("createdOn")),
-                "last_updated": format_consent_date(row.get("lastUpdatedOn")),
-                "closed_on": format_consent_date(row.get("closedOn")),
+                # Odoo source dates -> Flask Consent columns. G1: full datetime
+                # ('%Y-%m-%d %H:%M:%S', parsed by the route's _parse_date); ""
+                # lets the route store no value (no fabrication).
+                "sent_on": format_consent_datetime(row.get("sentOn")),
+                "delivered_on": format_consent_datetime(row.get("deliveredOn")),
+                "valid_till": format_consent_datetime(row.get("validTill")),
+                "consent_reject_on": format_consent_datetime(row.get("consentRejectOn")),
+                # Audit timestamps -> created_at / updated_at / closed_on.
+                "created_on": format_consent_datetime(row.get("createdOn")),
+                "last_updated": format_consent_datetime(row.get("lastUpdatedOn")),
+                "closed_on": format_consent_datetime(row.get("closedOn")),
                 # Consent-proof + traceability fields (DPDP evidence). Carry
                 # artifact verbatim - same {nameId}_{ts}_{PA}_{?}_{tmpl} format
                 # as Flask; regenerating would break traceability.
