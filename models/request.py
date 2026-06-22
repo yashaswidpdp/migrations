@@ -38,9 +38,10 @@ class OdooRequest:
     closedOn: Optional[str] = None
     # by-id (/dpgr/id) extra fields. dpComment/escalatedComment/escalatedDate/
     # closingComment/withdrawalComment are free-text + close/escalation; iPAddress/
-    # deviceType are DPDP request-proof. attachment/consent/dataDiscovery/
-    # trackAssigneeStatus/vendor_activity have no create-path target and are
-    # intentionally dropped (see issue_report).
+    # deviceType are DPDP request-proof. consent -> revoke-link; trackAssigneeStatus
+    # -> real allottee identity/state; assignToDM -> internal allottee;
+    # assignToVendor -> vendor<->request activity link (all now migrated).
+    # attachment/dataDiscovery still have no create-path target -> dropped.
     dpComment: Optional[str] = None
     escalatedComment: Optional[str] = None
     escalatedDate: Optional[str] = None
@@ -48,6 +49,11 @@ class OdooRequest:
     withdrawalComment: Optional[str] = None
     iPAddress: Optional[str] = None
     deviceType: Optional[str] = None
+    # Vendor handling the request + internal allottee (Data Manager); each a
+    # `[ {id, name} ]` array on /dpgr/id.
+    assignToVendor: List[dict] = field(default_factory=list)
+    assignToDM: List[dict] = field(default_factory=list)
+    trackAssigneeStatus: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -60,7 +66,17 @@ class FlaskRequestPayload:
     processing_activity_names: List[str] = field(default_factory=list)
     # Odoo consent ids to withdraw (revoke requests); backend resolves via source-map.
     consent_source_ids: List[int] = field(default_factory=list)
+    # Vendor<->request "activity" link from /dpgr/id `assignToVendor`. Odoo
+    # vendor-contact ids + names; backend resolves to Flask vendors via the
+    # vendor source-map (name is the resolution fallback).
+    assigned_vendor_source_ids: List[int] = field(default_factory=list)
+    assigned_vendor_names: List[str] = field(default_factory=list)
+    # Real internal allottee from /dpgr/id `assignToDM`; loader resolves
+    # NAMES -> Flask user ids (assigned_users) via the backend-user catalogue.
     assigned_user_names: List[str] = field(default_factory=list)
+    # Allotment state + when, from trackAssigneeStatus (e.g. "assigned_dm").
+    assignee_status: Optional[str] = None
+    assignee_raised_on: Optional[str] = None
     status: str = "Initiated"
     rag_status: str = "Green"
     otp_required: bool = False
