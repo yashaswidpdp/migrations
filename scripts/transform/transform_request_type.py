@@ -63,18 +63,20 @@ SLA_NUMERIC_FIELDS = {
 }
 
 # Backend request_type_routes.validate_sla_thresholds coerces every missing SLA
-# field to 0 and rejects 0 ("must be greater than zero"), then enforces ordering:
-#   sla_expected_days > amber_alert_days > red_alert_days
-#   amber_alert_days  >= sla_amber_notification_days
-#   red_alert_days    >= sla_red_notification_days
+# field to 0 and rejects 0 ("must be greater than zero"), then enforces ordering.
+# The model is days-ELAPSED (days_open): each threshold is the day the stage
+# starts, so amber comes before red, both within the SLA window:
+#   amber_alert_days   <  red_alert_days  <=  sla_expected_days
+#   sla_amber_notification_days  <=  amber_alert_days
+#   sla_red_notification_days    <=  red_alert_days
 # Odoo often ships 0/partial SLA, so when the source set is incomplete or breaks
 # these rules we replace ALL five with this valid default block.
 DEFAULT_SLA_BLOCK = {
     "sla_expected_days": 45,
-    "amber_alert_days": 30,
-    "red_alert_days": 15,
-    "sla_amber_notification_days": 15,
-    "sla_red_notification_days": 7,
+    "amber_alert_days": 15,
+    "red_alert_days": 30,
+    "sla_amber_notification_days": 7,
+    "sla_red_notification_days": 15,
 }
 
 
@@ -88,8 +90,9 @@ def _as_positive_int(v):
 
 
 def _sla_block_valid(b: dict) -> bool:
-    """Mirror backend validate_sla_thresholds: all five present, positive, and
-    sla_expected > amber_alert > red_alert, with notification days within alerts."""
+    """Mirror backend validate_sla_thresholds (days-elapsed model): all five
+    present, positive, and amber_alert < red_alert <= sla_expected, with each
+    notification day within its alert."""
     e = b["sla_expected_days"]
     a = b["amber_alert_days"]
     r = b["red_alert_days"]
@@ -97,7 +100,7 @@ def _sla_block_valid(b: dict) -> bool:
     rn = b["sla_red_notification_days"]
     if None in (e, a, r, an, rn):
         return False
-    return e > a > r and a >= an and r >= rn
+    return e >= r > a and a >= an and r >= rn
 
 
 def _resolve_sla_block(rec: dict, name: str) -> dict:

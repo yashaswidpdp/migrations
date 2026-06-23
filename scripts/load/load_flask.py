@@ -424,9 +424,12 @@ class FlaskLoader:
         logger.info(f"Request-type seed summary: {created} created, {skipped} skipped, {failed} failed.")
 
     def load_request_types(self, json_file: str = "processed_request_types.json"):
-        """Load transformed Odoo request types (data/processed) into Flask via
-        POST /request-types/create. Idempotent: skips any name already present.
-        Must run before consent + request loads so request_type_name resolves."""
+        """Load transformed Odoo request types (data/processed) into Flask.
+        New names -> POST /request-types/create; names already present ->
+        PUT /request-types/<id> so re-runs propagate SLA/flag fixes instead of
+        skipping (create never touches an existing record). Idempotent: re-running
+        with the same payload is a no-op update. Must run before consent + request
+        loads so request_type_name resolves."""
         path = os.path.join(DATA_PROCESSED_DIR, json_file)
         if not os.path.exists(path):
             logger.error(f"Processed request-type file not found: {path}")
@@ -435,14 +438,32 @@ class FlaskLoader:
             payloads = json.load(f)
 
         existing = self._resolve_request_type_map()  # name(lower) -> id
-        created = skipped = failed = 0
+        created = updated = failed = 0
         for p in payloads:
             name = str(p.get("name", "")).strip()
             if not name:
                 continue
-            if name.lower() in existing:
-                logger.info(f"Request type '{name}' already exists (id={existing[name.lower()]}). Skipping.")
-                skipped += 1
+            rt_id = existing.get(name.lower())
+            if rt_id is not None:
+                # Already present: PUT the payload so SLA-model changes land on the
+                # existing record. Backend updates only the fields we send and
+                # leaves the rest (e.g. is_active) untouched.
+                try:
+                    resp = requests.put(
+                        f"{self.base_url}/request-types/{rt_id}",
+                        headers=self.headers,
+                        json=p,
+                        timeout=30,
+                    )
+                    if resp.status_code in (200, 201):
+                        logger.info(f"Updated request type '{name}' (id={rt_id}).")
+                        updated += 1
+                    else:
+                        logger.error(f"Failed to update request type '{name}' (id={rt_id}): {resp.status_code} - {resp.text}")
+                        failed += 1
+                except Exception as e:
+                    logger.error(f"Exception updating request type '{name}' (id={rt_id}): {e}")
+                    failed += 1
                 continue
             try:
                 resp = requests.post(
@@ -454,15 +475,13 @@ class FlaskLoader:
                 if resp.status_code in (200, 201):
                     logger.info(f"Created request type '{name}'.")
                     created += 1
-                elif resp.status_code == 400 and "already exists" in resp.text:
-                    skipped += 1
                 else:
                     logger.error(f"Failed to create request type '{name}': {resp.status_code} - {resp.text}")
                     failed += 1
             except Exception as e:
                 logger.error(f"Exception creating request type '{name}': {e}")
                 failed += 1
-        logger.info(f"Request-type load summary: {created} created, {skipped} skipped, {failed} failed.")
+        logger.info(f"Request-type load summary: {created} created, {updated} updated, {failed} failed.")
 
     def _resolve_user_ids(self) -> dict:
         """Fetch all backend users from Flask and map their names to user IDs."""
