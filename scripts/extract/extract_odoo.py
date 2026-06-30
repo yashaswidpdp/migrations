@@ -1,9 +1,13 @@
 import requests
 import pandas as pd
 import os
+import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv("config/.env")
 
@@ -13,6 +17,12 @@ ODOO_SESSION_ID = os.getenv("ODOO_SESSION_ID")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))
 MAX_RECORDS = int(os.getenv("MAX_RECORDS", 0))  # 0 means no limit
 DATA_RAW_DIR = os.getenv("DATA_RAW_DIR", "data/raw")
+# Concurrency for the N+1 by-id enrichment fan-out. Each enrich step makes one
+# HTTP call per record (100k records -> 100k calls); running them sequentially
+# is the migration's dominant cost. Pure I/O wait, so a thread pool gives a
+# near-linear speedup. Start conservative (server rate-limit / WAF); raise if
+# the Odoo side tolerates it.
+ENRICH_WORKERS = int(os.getenv("ENRICH_WORKERS", 16))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,92 +40,164 @@ class OdooExtractor:
         self.cookies = {
             "session_id": session_id
         }
+        # One pooled, keep-alive session reused for every call. Previously each
+        # requests.get() opened a fresh TLS connection — at 100k by-id calls the
+        # repeated handshakes dominate. pool_maxsize must cover ENRICH_WORKERS so
+        # concurrent threads don't serialize on a too-small connection pool.
+        # Retry/backoff absorbs transient 429/5xx (incl. rate-limit pushback when
+        # threads ramp up). Auth (Authorization/cookies) lives on the session.
+        pool = max(ENRICH_WORKERS, 32)
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+        )
+        adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=retry)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.session.cookies.update(self.cookies)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def _fetch_page(self, endpoint: str, page: int, filters: Dict[str, Any] = None):
+        """Fetch a single dashboard page. Returns (records, total_pages, ok).
+
+        `total_pages` is the `pagination.total_page` value when the endpoint
+        provides it (else None). `ok` is False on HTTP error, the HTTP-200 auth
+        error envelope, or an exception — callers abort rather than treat it as
+        an empty page.
+        """
+        params = {"page_no": page, "rec_limit": BATCH_SIZE}
+        if filters:
+            params.update(filters)
+        try:
+            response = self.session.get(f"{self.base_url}{endpoint}", params=params, timeout=30)
+            if response.status_code != 200:
+                logger.error(f"Failed to fetch page {page}: {response.status_code} - {response.text}")
+                return [], None, False
+
+            data = response.json()
+            # Odoo wraps auth errors in an HTTP-200 envelope, e.g.
+            # {"message": "Token Expired", "status_code": 401}. Abort loudly
+            # instead of treating it as an empty page.
+            if isinstance(data, dict) and data.get("status_code", 200) != 200:
+                logger.error(
+                    f"API error envelope on page {page}: {data.get('status_code')} - "
+                    f"{data.get('message')}. Refresh ODOO_JWT_TOKEN in config/.env."
+                )
+                return [], None, False
+
+            # Check where records are nested in the response
+            if isinstance(data, list):
+                records = data
+            else:
+                # Look for known keys or the first list found in the dict
+                records = data.get("records", data.get("data", data.get("dpcmData", data.get("dpgrData", []))))
+                if not records:
+                    # Fallback: find any key that contains a list
+                    for key, value in data.items():
+                        if isinstance(value, list):
+                            records = value
+                            break
+
+            pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+            return records or [], pagination.get("total_page"), True
+        except Exception as e:
+            logger.exception(f"Exception occurred during extraction (page {page}): {e}")
+            return [], None, False
 
     def fetch_records(self, endpoint: str, filters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Fetch all records from a paginated Odoo dashboard endpoint.
+
+        Page 1 is fetched first to learn `pagination.total_page`; the remaining
+        pages are then fetched concurrently (ENRICH_WORKERS) when the total is
+        known. Falls back to sequential paging when the endpoint omits
+        total_page, or when a MAX_RECORDS test-limit is set (a parallel fan-out
+        can't honor an early stop cleanly).
         """
-        Fetch records from Odoo API using POST requests for dashboard/list endpoints.
-        Handles offset pagination using page_no and rec_limit.
-        """
-        all_records = []
-        page = 1
-        
-        while True:
-            logger.info(f"Fetching page {page} for {endpoint}...")
-            
-            params = {
-                "page_no": page,
-                "rec_limit": BATCH_SIZE
-            }
-            if filters:
-                params.update(filters)
+        logger.info(f"Fetching page 1 for {endpoint}...")
+        first, total_pages, ok = self._fetch_page(endpoint, 1, filters)
+        if not ok:
+            logger.error("Aborting extraction (page 1 failed).")
+            return []
+        if not first:
+            logger.info("No records found.")
+            return []
+        all_records = list(first)
+        logger.info(f"Successfully fetched {len(first)} records from page 1.")
 
-            try:
-                response = requests.get(
-                    f"{self.base_url}{endpoint}",
-                    headers=self.headers,
-                    cookies=self.cookies,
-                    params=params,
-                    timeout=30
-                )
-                
-                if response.status_code != 200:
-                    logger.error(f"Failed to fetch page {page}: {response.status_code} - {response.text}")
-                    break
-                
-                data = response.json()
+        # Sequential fallback: unknown page count, or a MAX_RECORDS test-limit.
+        if total_pages is None or (MAX_RECORDS and MAX_RECORDS > 0):
+            return self._paginate_sequential(endpoint, filters, all_records, total_pages)
 
-                # Odoo wraps auth errors in an HTTP-200 envelope, e.g.
-                # {"message": "Token Expired", "status_code": 401}. Abort loudly
-                # instead of treating it as an empty page.
-                if isinstance(data, dict) and data.get("status_code", 200) != 200:
-                    logger.error(
-                        f"API error envelope on page {page}: {data.get('status_code')} - "
-                        f"{data.get('message')}. Refresh ODOO_JWT_TOKEN in config/.env."
-                    )
-                    break
+        if total_pages <= 1:
+            return all_records
 
-                # Check where records are nested in the response
-                if isinstance(data, list):
-                    records = data
+        pages = list(range(2, total_pages + 1))
+        logger.info(f"{endpoint}: {total_pages} pages total; fetching 2..{total_pages} "
+                    f"with {ENRICH_WORKERS} workers...")
+        with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as ex:
+            results = list(ex.map(lambda p: self._fetch_page(endpoint, p, filters), pages))
+
+        # Fail-fast on incompleteness: a silently-dropped page would yield a short
+        # dataset that only reconcile catches later. Retry any failed pages once
+        # (the session's own retry/backoff already covers transient blips), then
+        # abort loudly if any still fail — never return a known-incomplete pull.
+        page_records = {}
+        failed = []
+        for page, (records, _tp, page_ok) in zip(pages, results):
+            if page_ok:
+                page_records[page] = records
+            else:
+                failed.append(page)
+        if failed:
+            logger.warning(f"{endpoint}: {len(failed)} page(s) failed; retrying once: {failed}")
+            for page in failed:
+                records, _tp, page_ok = self._fetch_page(endpoint, page, filters)
+                if page_ok:
+                    page_records[page] = records
                 else:
-                    # Look for known keys or the first list found in the dict
-                    records = data.get("records", data.get("data", data.get("dpcmData", data.get("dpgrData", []))))
-                    if not records:
-                        # Fallback: find any key that contains a list
-                        for key, value in data.items():
-                            if isinstance(value, list):
-                                records = value
-                                break
-                
-                if not records:
-                    logger.info("No more records found.")
-                    break
-                
-                all_records.extend(records)
-                logger.info(f"Successfully fetched {len(records)} records from page {page}.")
-                
-                # Check for max records limit
-                if MAX_RECORDS > 0 and len(all_records) >= MAX_RECORDS:
-                    logger.info(f"Reached MAX_RECORDS limit of {MAX_RECORDS}. Stopping extraction.")
-                    all_records = all_records[:MAX_RECORDS]
-                    break
+                    raise RuntimeError(
+                        f"Extraction ABORTED: {endpoint} page {page} failed twice. "
+                        f"Refusing to return an incomplete dataset (check ODOO_JWT_TOKEN / rate limits)."
+                    )
+        for page in pages:                      # extend in page order (determinism)
+            all_records.extend(page_records[page])
+        logger.info(f"Fetched {len(all_records)} total records from {endpoint}.")
+        return all_records
 
-                # Use total_page from the response pagination object when available;
-                # fall back to record-count heuristic for endpoints that omit it.
-                pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
-                total_pages = pagination.get("total_page")
-                if total_pages is not None:
-                    if page >= total_pages:
-                        break
-                elif len(records) < BATCH_SIZE:
-                    break
+    def _paginate_sequential(self, endpoint, filters, all_records, total_pages, start_page=2):
+        """Sequential page walk from `start_page`, continuing into `all_records`
+        (which already holds page 1). Used when total_page is unknown (stop on a
+        short page) or a MAX_RECORDS limit is active (stop once reached)."""
+        page = start_page
+        while True:
+            if MAX_RECORDS and MAX_RECORDS > 0 and len(all_records) >= MAX_RECORDS:
+                logger.info(f"Reached MAX_RECORDS limit of {MAX_RECORDS}. Stopping extraction.")
+                return all_records[:MAX_RECORDS]
 
-                page += 1
-                
-            except Exception as e:
-                logger.exception(f"Exception occurred during extraction: {e}")
+            logger.info(f"Fetching page {page} for {endpoint}...")
+            records, tp, ok = self._fetch_page(endpoint, page, filters)
+            if not ok:
                 break
-                
+            if not records:
+                logger.info("No more records found.")
+                break
+            all_records.extend(records)
+            logger.info(f"Successfully fetched {len(records)} records from page {page}.")
+
+            if tp is not None:
+                total_pages = tp
+            if total_pages is not None:
+                if page >= total_pages:
+                    break
+            elif len(records) < BATCH_SIZE:
+                break
+            page += 1
+
+        if MAX_RECORDS and MAX_RECORDS > 0:
+            return all_records[:MAX_RECORDS]
         return all_records
 
     def fetch_simple(self, endpoint: str) -> dict:
@@ -129,10 +211,8 @@ class OdooExtractor:
         url = f"{self.base_url}{endpoint}"
         logger.info(f"Fetching (non-paginated): {url}")
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
-                headers=self.headers,
-                cookies=self.cookies,
                 timeout=60,
             )
             if response.status_code != 200:
@@ -162,10 +242,8 @@ class OdooExtractor:
         """
         url = f"{self.base_url}{endpoint}"
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
-                headers=self.headers,
-                cookies=self.cookies,
                 params={"id": record_id},
                 timeout=30,
             )
@@ -208,7 +286,6 @@ class OdooExtractor:
 
     def save_to_json(self, data: object, filename: str):
         """Save raw response (dict or list) as JSON — used for tree-structured data."""
-        import json
         os.makedirs(DATA_RAW_DIR, exist_ok=True)
         filepath = os.path.join(DATA_RAW_DIR, filename)
         with open(filepath, "w", encoding="utf-8") as f:
@@ -287,6 +364,57 @@ def run_stakeholder_extraction(output_file: str = "raw_stakeholders.json"):
         logger.error("Stakeholder extraction returned empty response.")
 
 
+def _enrich_ids(extractor, endpoint, result_key, ids, checkpoint_path, label):
+    """Fetch one by-id record per id, concurrently, with on-disk checkpointing.
+
+    Returns {id: rec_dict} covering every id in `ids` (missing/failed -> {}).
+
+    Resume: the checkpoint is a JSONL file (one `{"id":.., "rec":..}` per line).
+    On entry, ids already in the file are loaded and skipped, so a run killed at
+    record 90k (token expiry, network drop, crash) resumes instead of re-fetching
+    from zero. ex.map preserves submission order, so the main thread owns every
+    file write — no lock needed. The caller removes the checkpoint only after the
+    enriched CSV is safely written.
+    """
+    cache = {}
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    cache[str(row["id"])] = row.get("rec") or {}
+                except (ValueError, KeyError):
+                    continue  # tolerate a half-written final line from a hard kill
+        if cache:
+            logger.info(f"Resuming {label}: {len(cache)}/{len(ids)} already cached "
+                        f"in {checkpoint_path}")
+
+    missing = [rid for rid in ids if str(rid) not in cache]
+    if not missing:
+        logger.info(f"{label}: all {len(ids)} ids already cached; skipping fetch.")
+    else:
+        total = len(missing)
+        done = 0
+        # Append mode: each completed record is flushed so a crash loses at most
+        # the in-flight batch. Workers only do HTTP; this loop does all writes.
+        with open(checkpoint_path, "a", encoding="utf-8") as fh, \
+             ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as ex:
+            for rid, rec in zip(missing, ex.map(
+                lambda r: extractor.fetch_by_id(endpoint, r, result_key=result_key), missing)):
+                rec = rec or {}
+                cache[str(rid)] = rec
+                fh.write(json.dumps({"id": rid, "rec": rec}) + "\n")
+                done += 1
+                if done % 500 == 0:
+                    fh.flush()
+                    logger.info(f"Enriched {done}/{total} {label} "
+                                f"(cached {len(cache)}/{len(ids)})...")
+    return {rid: cache.get(str(rid), {}) for rid in ids}
+
+
 def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     """Enrich the dashboard request CSV with the per-record by-id fields the
     dashboard omits — chiefly `requestType [id, name]`, the assignee carried in
@@ -297,7 +425,6 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     `/dpgr/dashboard` has no request type / assignee / vendor link at all;
     `GET /dpgr/id?id=<N>` carries all of them.
     """
-    import json
     path = os.path.join(DATA_RAW_DIR, raw_file)
     if not os.path.exists(path):
         logger.error(f"Cannot enrich, raw file not found: {path}")
@@ -317,15 +444,23 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
                  "deviceType", "resolutionDate", "closedOn", "actionDate")
 
     extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
+    ids = df["id"].tolist()
+
+    # Parallel I/O fan-out with resume: one GET /dpgr/id per record. Returns
+    # {id: rec} for every id; recs[i] lines up with df row i. Column assembly
+    # below stays single-threaded.
+    checkpoint = os.path.join(DATA_RAW_DIR, raw_file + ".enrich.jsonl")
+    rec_by_id = _enrich_ids(extractor, "/dpgr/id", "dpgr", ids, checkpoint, "requests")
+    recs = [rec_by_id[rid] for rid in ids]
+
     request_types, assignee_emails, consents = [], [], []
     # New: vendor<->request activity link + real internal allottee. Both arrive
     # as `[ {id, name} ]` arrays on /dpgr/id; carried verbatim as JSON so the
     # transform owns the id/name extraction (mirrors the `consent` column).
     assign_to_vendors, assign_to_dms = [], []
-    assignee_names, assignee_statuses, assignee_raised_ons = [], [], []
+    assignee_statuses, assignee_raised_ons = [], []
     extra = {col: [] for col in byid_cols}
-    for i, rec_id in enumerate(df["id"].tolist(), 1):
-        rec = extractor.fetch_by_id("/dpgr/id", rec_id, result_key="dpgr")
+    for rec in recs:
         request_types.append(json.dumps(rec.get("requestType")) if rec.get("requestType") else "")
         track = rec.get("trackAssigneeStatus") or []
         first = track[0] if track and isinstance(track[0], dict) else {}
@@ -342,8 +477,6 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
         assign_to_dms.append(json.dumps(rec.get("assignToDM")) if rec.get("assignToDM") else "")
         for col in byid_cols:
             extra[col].append(rec.get(col) or "")
-        if i % 25 == 0:
-            logger.info(f"Enriched {i}/{len(df)} requests...")
 
     df["requestType"] = request_types
     df["assignee_email"] = assignee_emails
@@ -355,6 +488,9 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     for col in byid_cols:
         df[col] = extra[col]
     df.to_csv(path, index=False)
+    # CSV is safely written -> drop the resume checkpoint.
+    if os.path.exists(checkpoint):
+        os.remove(checkpoint)
     filled = sum(1 for x in request_types if x)
     vfilled = sum(1 for x in assign_to_vendors if x)
     logger.info(f"Request enrichment done: {filled}/{len(df)} rows carry requestType, "
@@ -366,7 +502,6 @@ def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
     dashboard left them blank (notably `userActivityType`). The by-id endpoint
     uses different key names (`digitalPaper`/`legacyLive`) — mapped back onto the
     dashboard column names the transform already reads."""
-    import json
     path = os.path.join(DATA_RAW_DIR, raw_file)
     if not os.path.exists(path):
         logger.error(f"Cannot enrich, raw file not found: {path}")
@@ -384,9 +519,17 @@ def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
             df[col] = ""
 
     extractor = OdooExtractor(ODOO_BASE_URL, ODOO_JWT_TOKEN, ODOO_SESSION_ID)
+    ids = df["id"].tolist()
+
+    # Parallel I/O fan-out with resume: one GET /dpcm/id per record. Returns
+    # {id: rec}; the df.loc mutations below stay single-threaded (pandas writes
+    # are not thread-safe).
+    checkpoint = os.path.join(DATA_RAW_DIR, raw_file + ".enrich.jsonl")
+    rec_by_id = _enrich_ids(extractor, "/dpcm/id", "dpcm", ids, checkpoint, "consents")
+
     filled = 0
-    for i, rec_id in enumerate(df["id"].tolist(), 1):
-        rec = extractor.fetch_by_id("/dpcm/id", rec_id, result_key="dpcm")
+    for rec_id in ids:
+        rec = rec_by_id.get(rec_id)
         if not rec:
             continue
         idx = df.index[df["id"] == rec_id]
@@ -420,10 +563,11 @@ def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
                 byid_val = json.dumps(byid_val) if byid_val else ""
             if byid_val and df.loc[idx, csv_col].apply(_blank).all():
                 df.loc[idx, csv_col] = byid_val
-        if i % 25 == 0:
-            logger.info(f"Enriched {i}/{len(df)} consents...")
 
     df.to_csv(path, index=False)
+    # CSV is safely written -> drop the resume checkpoint.
+    if os.path.exists(checkpoint):
+        os.remove(checkpoint)
     logger.info(f"Consent enrichment done: backfilled userActivityType on {filled} rows. Updated {path}")
 
 

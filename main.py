@@ -640,5 +640,121 @@ def reconcile(no_write, self_test, live, cached_source):
         click.echo(f"\n[written] {REPORT_PATH}")
 
 
+# ==========================================
+# FULL MIGRATION ORCHESTRATOR
+# One command, dependency-ordered, end-to-end. Kept self-contained: it reuses
+# the same run_* pipeline functions the per-entity `run-all` commands use, so it
+# never drifts from them.
+# ==========================================
+@cli.command(name="migrate-all")
+@click.option("--user-id", "user_id", type=int, default=None,
+              help="Flask user_id set as assigned_users on every request (passed to the request stage).")
+@click.option("--continue-on-error", is_flag=True,
+              help="Keep going if a stage fails. Default: abort, since later stages depend on earlier ones.")
+def migrate_all(user_id, continue_on_error):
+    """Run the ENTIRE migration end-to-end, in dependency order:
+
+      1. request-type   2. stakeholder   3. processing-activity
+      4. templates (+ PA<->template link backfill)   5. vendors
+      6. consents (DPCM)   7. requests (DPGR)
+
+    Each entity runs extract -> transform -> load (the same pipelines as the
+    per-entity `run-all`). Idempotent: safe to re-run — completed rows 409-skip.
+
+    PREREQUISITES (not done here): a running Flask app booted via
+    `migration_ext.serve`, and licenses seeded for the tenant
+    (`python -m migration_ext.ensure_license --tenant <id>`). Without licenses
+    the consent/request/vendor stages fail with "No active license".
+    """
+    import time
+
+    def _request_type():
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
+
+    def _stakeholder():
+        run_stakeholder_extraction("raw_stakeholders.json")
+        transform_stakeholder_data("raw_stakeholders.json", "processed_stakeholders.csv")
+        run_stakeholder_loading("processed_stakeholders.csv")
+
+    def _processing_activity():
+        run_pa_extraction("raw_processing_activities.json")
+        transform_processing_activity_data("raw_processing_activities.json",
+                                           "processed_processing_activities.csv")
+        run_pa_loading("processed_processing_activities.csv")
+        # PA link-patch is intentionally deferred to the template stage: templates
+        # don't exist yet, so patching template refs onto PAs here would no-op.
+
+    def _templates():
+        run_template_extraction("raw_templates.json")
+        transform_template_data("raw_templates.json", "processed_templates.csv")
+        run_template_load_and_approve("processed_templates.csv")
+        # Both PAs and templates now exist -> backfill BOTH link directions
+        # (template refs onto PAs, PA links onto templates). Idempotent.
+        run_pa_link_patch("processed_processing_activities.csv")
+        run_template_pa_link_patch("processed_templates.csv")
+
+    def _vendors():
+        run_vendor_extraction("raw_vendors.json")
+        transform_vendor_data("raw_vendors.json", "processed_vendors.csv")
+        run_vendor_loading("processed_vendors.csv")
+
+    def _consents():
+        run_extraction("/dpcm/dashboard", "raw_consents.csv")
+        run_consent_enrichment("raw_consents.csv")
+        transform_consent_data("raw_consents.csv", "processed_consents.csv")
+        run_consent_migration_loading("processed_consents.csv")
+
+    def _requests():
+        run_extraction("/dpgr/dashboard", "raw_requests.csv")
+        run_request_enrichment("raw_requests.csv")
+        transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
+        # Request types are master data for requests; idempotent reload mirrors
+        # `request run-all` so a stand-alone requests stage still resolves types.
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
+        run_loading("processed_requests.csv", "/migration/request")
+
+    pipeline = [
+        ("request-type", _request_type),
+        ("stakeholder", _stakeholder),
+        ("processing-activity", _processing_activity),
+        ("templates + PA links", _templates),
+        ("vendors", _vendors),
+        ("consents (DPCM)", _consents),
+        ("requests (DPGR)", _requests),
+    ]
+
+    bar = "=" * 64
+    logger.info("migrate-all: starting full migration (%d stages)", len(pipeline))
+    overall = time.time()
+    failed = []
+    for idx, (name, fn) in enumerate(pipeline, 1):
+        click.echo(f"\n{bar}\n### STAGE {idx}/{len(pipeline)}: {name}\n{bar}")
+        logger.info("migrate-all stage %d/%d start: %s", idx, len(pipeline), name)
+        t0 = time.time()
+        try:
+            fn()
+            click.echo(f"--- stage {idx} '{name}' OK ({time.time() - t0:.1f}s) ---")
+            logger.info("migrate-all stage %d done: %s (%.1fs)", idx, name, time.time() - t0)
+        except Exception as e:
+            failed.append(name)
+            logger.exception("migrate-all stage %d FAILED: %s: %s", idx, name, e)
+            click.echo(f"!!! stage {idx} '{name}' FAILED: {e}", err=True)
+            if not continue_on_error:
+                click.echo(f"\nABORTED at stage {idx} '{name}'. Fix the cause and re-run "
+                           f"`migrate-all` (idempotent — completed rows 409-skip), or pass "
+                           f"--continue-on-error to push past stage failures.", err=True)
+                raise SystemExit(1)
+
+    dur = time.time() - overall
+    if failed:
+        click.echo(f"\nmigrate-all finished WITH FAILURES in: {', '.join(failed)} ({dur:.0f}s total).", err=True)
+        raise SystemExit(1)
+    click.echo(f"\nmigrate-all COMPLETE — all {len(pipeline)} stages OK ({dur:.0f}s total).")
+
+
 if __name__ == "__main__":
     cli()

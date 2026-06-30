@@ -6,8 +6,11 @@ import logging
 import ast
 import base64
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 import openpyxl
 from typing import Optional
 
@@ -21,6 +24,11 @@ load_dotenv("config/.env")
 FLASK_API_BASE_URL = os.getenv("FLASK_API_BASE_URL")
 FLASK_API_KEY = os.getenv("FLASK_API_KEY")
 DATA_PROCESSED_DIR = os.getenv("DATA_PROCESSED_DIR", "data/processed")
+# Concurrency for the consent load. Writes are sharded by principal (same
+# principal never written by two workers at once), so this is the number of
+# *distinct principals* loaded in parallel. Kept lower than the read-side
+# ENRICH_WORKERS because each request does DB work + a commit. Tune per server.
+LOAD_WORKERS = int(os.getenv("LOAD_WORKERS", 16))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +47,16 @@ class FlaskLoader:
         tenant_domain = os.getenv("FLASK_TENANT_DOMAIN")
         if tenant_domain:
             self.headers["Host"] = tenant_domain.strip()
+        # Pooled keep-alive session shared across loader threads. NO status
+        # retries: a POST that times out *after* the server committed must not be
+        # auto-resent (it would double-insert); failures are captured per row and
+        # re-run idempotently instead. Pool sized to cover LOAD_WORKERS.
+        pool = max(LOAD_WORKERS, 16)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=0)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def _record_source_map(self, entity, odoo_id, flask_id, sub_key=""):
         """Record an odoo->flask mapping in the migration ledger for entities
@@ -86,16 +104,17 @@ class FlaskLoader:
         df = pd.read_csv(input_path, dtype={"phone": str})
         logger.info(f"Loaded {len(df)} records from {csv_filename}")
 
-        success_count = 0
-        failure_rows = []
         error_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
 
         pa_map = self._resolve_pa_ids()
         default_request_type_id = self._resolve_request_type_id()
         request_type_map = self._resolve_request_type_map()
 
-        for index, row in df.iterrows():
-            record_data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
+        def _prepare(row_dict):
+            """Build the POST body for one row (PA/request-type resolution,
+            assigned_users parse, phone/email synthesis). Unchanged from the old
+            per-row prep — just lifted out so it runs before the parallel phase."""
+            record_data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row_dict.items()}
 
             pa_name = record_data.get("processing_activity_name")
             if pa_name:
@@ -152,51 +171,67 @@ class FlaskLoader:
             record_data.pop("processing_activity_names", None)
             record_data.pop("assigned_user_names", None)
             record_data.pop("manager_name", None)
+            return record_data
 
+        records = [_prepare(row.to_dict()) for _i, row in df.iterrows()]
+        total = len(records)
+
+        # Shard on principal AND vendor so neither the same data principal
+        # (phone/email) nor the same vendor (the VendorActivity/M2M the server
+        # creates) is written by two workers at once. Sharding runs on the
+        # PREPARED records, so the synthesized phone/email are what's keyed (same
+        # identity the server resolves). Distinct shards run in parallel.
+        shards = self._shard_by_keys(records, [self._phone_key, self._email_key, self._vendor_keys])
+        logger.info(f"{total} records grouped into {len(shards)} shards; loading with {LOAD_WORKERS} workers.")
+
+        success_count = 0
+        failure_rows = []
+        done = 0
+        lock = threading.Lock()
+
+        def _post(record_data, label):
             try:
-                response = requests.post(
-                    f"{self.base_url}{endpoint}",
-                    headers=self.headers,
-                    json=record_data,
-                    timeout=30,
-                )
-
-                # Identity-conflict retry: a 409 mentioning "Data Principal"
-                # means the carried phone resolves to a DIFFERENT principal than
-                # the email (shared dummy numbers in the source). Re-key by email
-                # alone so the request still attaches to the right person. A 409
+                response = self.session.post(f"{self.base_url}{endpoint}", json=record_data, timeout=30)
+                # Identity-conflict retry: a 409 mentioning "Data Principal" means
+                # the carried phone resolves to a DIFFERENT principal than the
+                # email (shared dummy numbers). Re-key by email alone. A 409
                 # WITHOUT that phrase is the idempotent "already migrated" case.
-                if (
-                    response.status_code == 409
-                    and record_data.get("phone")
-                    and "data principal" in response.text.lower()
-                ):
+                if (response.status_code == 409 and record_data.get("phone")
+                        and "data principal" in response.text.lower()):
                     retry = {k: v for k, v in record_data.items() if k != "phone"}
-                    logger.warning(
-                        f"Record {index + 1}: phone collided with another principal; "
-                        f"retrying email-only."
-                    )
-                    response = requests.post(
-                        f"{self.base_url}{endpoint}",
-                        headers=self.headers,
-                        json=retry,
-                        timeout=30,
-                    )
+                    logger.warning(f"Record {label}: phone collided with another principal; retrying email-only.")
+                    response = self.session.post(f"{self.base_url}{endpoint}", json=retry, timeout=30)
 
-                if response.status_code in [200, 201]:
-                    logger.info(f"Loaded record {index + 1}/{len(df)}")
-                    success_count += 1
-                elif response.status_code == 409 and "data principal" not in response.text.lower():
-                    # Genuinely already migrated (source-map hit) — idempotent skip.
-                    logger.info(f"Record {index + 1} already migrated. Skipping.")
-                    success_count += 1
-                else:
-                    logger.error(f"Failed record {index + 1}: {response.status_code} - {response.text}")
+                if response.status_code in (200, 201):
+                    return True
+                if response.status_code == 409 and "data principal" not in response.text.lower():
+                    return True  # genuinely already migrated (source-map hit) — idempotent skip
+                with lock:
                     failure_rows.append({**record_data, "error_message": response.text, "status_code": response.status_code})
-
+                logger.error(f"Failed record {label}: {response.status_code} - {response.text[:300]}")
+                return False
             except Exception as e:
-                logger.error(f"Exception loading record {index + 1}: {e}")
-                failure_rows.append({**record_data, "error_message": str(e)})
+                with lock:
+                    failure_rows.append({**record_data, "error_message": str(e)})
+                logger.error(f"Exception loading record {label}: {e}")
+                return False
+
+        def _process_shard(idx_list):
+            """One shard (same principal/vendor) — sequential so the server never
+            races to create the same principal or VendorActivity twice."""
+            nonlocal success_count, done
+            ok = 0
+            for i in idx_list:
+                if _post(records[i], f"{i + 1}/{total}"):
+                    ok += 1
+            with lock:
+                success_count += ok
+                prev, done = done, done + len(idx_list)
+                if done // 500 != prev // 500 or done == total:
+                    logger.info(f"Loaded {done}/{total} records ({success_count} ok, {len(failure_rows)} failed)...")
+
+        with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as ex:
+            list(ex.map(_process_shard, shards))
 
         if failure_rows:
             pd.DataFrame(failure_rows).to_csv(error_file, index=False)
@@ -1112,22 +1147,45 @@ class FlaskLoader:
         return name_to_id
 
     def _fetch_existing_template_names(self) -> set:
-        """Fetch all template names already in Flask for the active tenant."""
+        """Every template name already in Flask, across ALL pages and statuses.
+
+        `GET /notice-templates/` paginates at default_per_page=10 — reading only
+        the first response (the old behavior) recognized just 10 of ~190 names, so
+        every re-run RE-CREATED the rest as duplicates (each duplicate default then
+        archived the prior one). Walk every page with a large per_page so the
+        skip-if-exists check is genuinely idempotent. No status filter is passed,
+        so Draft/Active/Archive are all included (an archived template's name is
+        still taken — don't recreate it)."""
+        names: set = set()
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/notice-templates/",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
-                body = response.json()
-                data = body.get("data", {})
-                records = data.get("templates", data.get("records", []))
-                if isinstance(records, list):
-                    return {r["name"] for r in records if isinstance(r, dict) and "name" in r}
+            while page <= 1000:                      # hard cap; bad pager can't loop forever
+                response = requests.get(
+                    f"{self.base_url}/notice-templates/",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 200},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
+                data = response.json().get("data", {})
+                if isinstance(data, dict):
+                    records = data.get("templates", data.get("records", []))
+                    pag = data.get("pagination", {}) or {}
+                else:
+                    records = data if isinstance(data, list) else []
+                    pag = {}
+                for r in records:
+                    if isinstance(r, dict) and "name" in r:
+                        names.add(r["name"])
+                total_pages = pag.get("totalPages")
+                has_next = pag.get("hasNext")
+                if not records or has_next is False or (total_pages and page >= int(total_pages)):
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not fetch existing templates: {e}")
-        return set()
+        return names
 
     def _resolve_pa_ids(self) -> dict:
         """name -> Flask PA id, across ALL pages. The endpoint paginates (50/page),
@@ -1450,6 +1508,92 @@ class FlaskLoader:
 
         stakeholder_report.write_report(results, csv_filename)
 
+    @staticmethod
+    def _shard_by_keys(records, key_funcs):
+        """Union-find sharder: group row indices so any two rows that share a key
+        land in the same shard. `key_funcs` is a list of callables (row -> iterable
+        of hashable keys); each func has its OWN namespace, so a phone and a vendor
+        id that happen to be equal never merge. Returns a list of index-lists; each
+        list is processed sequentially, distinct lists run in parallel. Rows that
+        produce no keys are singletons.
+
+        Used to keep writes that touch the same server-side entity serial: consent
+        load shards by principal (phone/email); request load also shards by vendor
+        (assigned_vendor_source_ids) so the same VendorActivity/M2M is never
+        created by two workers at once.
+        """
+        n = len(records)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        first = {}  # (func_index, key) -> first row index seen
+        for i, rec in enumerate(records):
+            for fi, kf in enumerate(key_funcs):
+                for k in kf(rec):
+                    if not k:
+                        continue
+                    nk = (fi, k)
+                    if nk in first:
+                        union(i, first[nk])
+                    else:
+                        first[nk] = i
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return list(groups.values())
+
+    @staticmethod
+    def _phone_key(rec):
+        return [str(rec.get("phone") or "").strip()]
+
+    @staticmethod
+    def _email_key(rec):
+        return [str(rec.get("email") or "").strip().lower()]
+
+    @staticmethod
+    def _vendor_keys(rec):
+        """Keys identifying the vendor(s) a request creates a VendorActivity/M2M
+        for, so two requests touching the same vendor stay in one shard (serial).
+
+        Emits BOTH the Odoo vendor id (`v<id>`) AND the normalized vendor name
+        (`n<name>`). The id is the stable source identity, but the BACKEND resolves
+        vendors by NAME (Vendor.company_name / User.name), and some requests carry
+        a name with no source id — so keying on name too closes the gap where two
+        same-vendor requests would otherwise land in different shards and race on
+        the VendorActivity create. Both live in this one key namespace, so sharing
+        either an id or a name groups the rows. Parses defensively."""
+        def _parse(val):
+            if not val:
+                return []
+            try:
+                return ast.literal_eval(val) if isinstance(val, str) else list(val)
+            except Exception:
+                return []
+
+        keys = [f"v{v}" for v in _parse(rec.get("assigned_vendor_source_ids"))]
+        keys += [
+            f"n{str(name).strip().lower()}"
+            for name in _parse(rec.get("assigned_vendor_names"))
+            if str(name).strip()
+        ]
+        return keys
+
+    @classmethod
+    def _shard_by_principal(cls, records):
+        """Consent sharding: same principal (phone OR email) stays serial."""
+        return cls._shard_by_keys(records, [cls._phone_key, cls._email_key])
+
     def load_consents_via_migration(self, csv_filename: str):
         """Load consents (paper + legacy together) via the migration extension
         endpoint /migration/consent, one JSON record per row.
@@ -1465,7 +1609,11 @@ class FlaskLoader:
             logger.error(f"Consent CSV not found: {input_path}")
             return
 
-        df = pd.read_csv(input_path)
+        # phone as string (matches the request + vendor loaders): without this,
+        # pandas infers a blank-bearing phone column as float64, so '08800865195'
+        # becomes 8800865195.0 — leading zero lost, trailing '.0' added — and that
+        # corrupted value reaches Flask. dtype=str preserves the exact digits.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         if df.empty:
             logger.info("No consent records to load.")
             return
@@ -1473,22 +1621,34 @@ class FlaskLoader:
         logger.info(f"Loaded {len(df)} consent records from {csv_filename}")
         pa_map = self._resolve_pa_ids()
 
-        success = 0
-        failures = []
-        for index, row in df.iterrows():
+        # Prepare every record up front (PA resolution etc.) so the parallel
+        # phase only does HTTP.
+        records = []
+        for _index, row in df.iterrows():
             record = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
-
             pa_name = record.get("processing_activity_name")
             if pa_name:
                 record["processing_activity_id"] = pa_map.get(str(pa_name).strip())
             record.pop("manager_name", None)
+            records.append(record)
 
+        total = len(records)
+        shards = self._shard_by_principal(records)
+        logger.info(f"{total} consents grouped into {len(shards)} principal shards; "
+                    f"loading with {LOAD_WORKERS} workers.")
+
+        success = 0
+        failures = []
+        done = 0
+        lock = threading.Lock()
+
+        def _post_consent(record, label):
+            """POST one consent. Returns True if ok/already-migrated, else appends
+            to `failures` and returns False. Mirrors the original per-row logic
+            (phone-collision -> email-only retry)."""
             try:
-                response = requests.post(
-                    f"{self.base_url}/migration/consent",
-                    headers=self.headers,
-                    json=record,
-                    timeout=60,
+                response = self.session.post(
+                    f"{self.base_url}/migration/consent", json=record, timeout=60,
                 )
                 # An identity collision on phone (the consent's principal shares a
                 # phone with a different existing principal) must NOT be swallowed
@@ -1496,26 +1656,43 @@ class FlaskLoader:
                 # attaches, mirroring the vendor loader.
                 if response.status_code == 409 and record.get("phone") and "phone" in response.text.lower():
                     retry = {k: v for k, v in record.items() if k != "phone"}
-                    logger.warning(f"Consent {index + 1}: phone collided with another principal; retrying email-only.")
-                    response = requests.post(
-                        f"{self.base_url}/migration/consent",
-                        headers=self.headers, json=retry, timeout=60,
+                    logger.warning(f"Consent {label}: phone collided with another principal; retrying email-only.")
+                    response = self.session.post(
+                        f"{self.base_url}/migration/consent", json=retry, timeout=60,
                     )
 
                 if response.status_code in (200, 201):
-                    logger.info(f"Loaded consent {index + 1}/{len(df)}")
-                    success += 1
-                elif response.status_code == 409 and "already migrated" in response.text.lower():
+                    return True
+                if response.status_code == 409 and "already migrated" in response.text.lower():
                     # True idempotent skip — the source-map already has this consent.
-                    logger.info(f"Consent {index + 1} already migrated. Skipping.")
-                    success += 1
-                else:
-                    # Real failure (incl. unrecoverable 409s, 400s). Never count as ok.
-                    logger.error(f"Consent {index + 1} failed: {response.status_code} - {response.text[:300]}")
+                    return True
+                # Real failure (incl. unrecoverable 409s, 400s). Never count as ok.
+                with lock:
                     failures.append({**record, "error": response.text, "status_code": response.status_code})
+                logger.error(f"Consent {label} failed: {response.status_code} - {response.text[:300]}")
+                return False
             except Exception as e:
-                logger.exception(f"Exception loading consent {index + 1}: {e}")
-                failures.append({**record, "error": str(e)})
+                with lock:
+                    failures.append({**record, "error": str(e)})
+                logger.exception(f"Exception loading consent {label}: {e}")
+                return False
+
+        def _process_shard(idx_list):
+            """All consents for one principal — run sequentially so the server
+            never races to create the same principal twice."""
+            nonlocal success, done
+            ok = 0
+            for i in idx_list:
+                if _post_consent(records[i], f"{i + 1}/{total}"):
+                    ok += 1
+            with lock:
+                success += ok
+                prev, done = done, done + len(idx_list)
+                if done // 500 != prev // 500 or done == total:
+                    logger.info(f"Loaded {done}/{total} consents ({success} ok, {len(failures)} failed)...")
+
+        with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as ex:
+            list(ex.map(_process_shard, shards))
 
         err_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
         if failures:

@@ -10,7 +10,7 @@ This repository is dedicated to the migration process from a legacy Odoo instanc
 - **`agents.md`**: Memory Context Protocol file used to track agent tasks, architectural decisions, and bug fixes across sessions.
 
 ### ETL Scripts (`scripts/`)
-- **`scripts/extract/extract_odoo.py`**: Handles HTTP requests to Odoo's custom APIs. Manages dual authentication (JWT + Session Cookie), pagination, and saves raw data to CSV/JSON.
+- **`scripts/extract/extract_odoo.py`**: Handles HTTP requests to Odoo's custom APIs. Manages dual authentication (JWT + Session Cookie), and saves raw data to CSV/JSON. Uses a pooled keep-alive session with concurrent pagination and concurrent, resumable by-id enrichment — see *Performance & Large-Volume Extraction*.
 - **`scripts/transform/transform_processing_activity.py`**: Contains the transformation logic for Processing Activities. Performs depth-first flattening on hierarchical trees.
 - **`scripts/transform/transform_template.py`**: Contains the transformation logic for Notice Templates, mapping languages and template types to Flask enums.
 - **`scripts/transform/transform_consent.py`**: Contains the transformation logic for Consents (`dpcmData`). Safely parses nested arrays, maps Odoo's legacy statuses/types to strict Flask Enums, and splits data into deemed and live records.
@@ -87,6 +87,28 @@ graph TD
 ---
 
 ## ▶️ Recommended End-to-End Sequence
+
+### Option A — one command (`migrate-all`)
+
+Runs every entity in dependency order (request-type → stakeholder →
+processing-activity → templates **+ PA↔template link backfill** → vendors →
+consents → requests), reusing the same pipelines as the per-entity `run-all`.
+
+```bash
+# prerequisites: Flask booted via `migration_ext.serve`, and licenses seeded:
+#   (in dpdp_python)  ./venv/bin/python -m migration_ext.ensure_license --tenant <id>
+cd migration
+python main.py migrate-all                      # whole migration, in order
+python main.py migrate-all --user-id <FLASK_USER_ID>   # optional fallback owner
+```
+
+- `--user-id` is **optional** — it only sets a fallback owner for requests that
+  have no allottee in the source. Each request's real allottee (Odoo `assignToDM`)
+  is resolved regardless. Omit it and source-unassigned requests migrate unassigned.
+- Aborts on the first stage failure (later stages depend on earlier); pass
+  `--continue-on-error` to push through. Idempotent — re-run after a fix.
+
+### Option B — stage by stage
 
 Run from the `migration/` directory, in this order. Each `run-all` does
 extract → transform → load for that entity.
@@ -196,6 +218,94 @@ python main.py vendor load
 # Loads Internal Stakeholders to /migration/stakeholder (email-free, idempotent)
 python main.py stakeholder load
 ```
+
+---
+
+## ⚡ Performance & Large-Volume Extraction
+
+Extraction has two HTTP phases, and at scale (100k+ consents/requests) the second
+one dominated — a naive run took **~3 hours**:
+
+1. **Dashboard pagination** (`fetch_records`) — paged `GET` over `/dpcm/dashboard`,
+   `/dpgr/dashboard`, etc.
+2. **By-id enrichment** (`run_consent_enrichment` / `run_request_enrichment`) — one
+   `GET /dpcm/id` or `/dpgr/id` **per record** to pull fields the dashboard omits.
+   100k records = 100k calls; sequential single-threaded, this was the bottleneck.
+
+Three optimizations cut that to roughly **~10 minutes**:
+
+- **Pooled keep-alive session.** `OdooExtractor` reuses one `requests.Session`
+  (connection pool sized to the worker count) instead of opening a fresh TLS
+  connection per call, with retry/backoff on `429/5xx`.
+- **Parallel pagination.** Page 1 is fetched to learn `pagination.total_page`, then
+  pages `2..N` are fetched concurrently. Endpoints that omit `total_page` fall back
+  to sequential paging (stop on a short page).
+- **Parallel enrichment.** The per-record by-id calls fan out across a thread pool.
+
+### `ENRICH_WORKERS` (concurrency)
+
+Set in `config/.env` (default `16`). Controls the thread-pool width for both the
+parallel pagination and the by-id enrichment fan-out.
+
+```bash
+ENRICH_WORKERS=16   # default; lower to 8 if Odoo rate-limits / WAF pushes back (429/503)
+```
+
+> [!IMPORTANT]
+> Before a large run, **refresh `ODOO_JWT_TOKEN`** — it expires in hours. Odoo
+> reports expiry as an HTTP-200 envelope (`{"status_code": 401, ...}`); the
+> extractor detects it and aborts loudly rather than saving an empty dataset.
+
+### Parallel loads — `LOAD_WORKERS` (consent + request)
+
+The consent (`/migration/consent`) and request (`/migration/request`) **loads** are
+also parallel, but a load is a *write* with shared server-side state, so it can't
+just fan out blindly — concurrent writes for the same data principal would
+double-create it. They are **sharded** instead:
+
+- **Consents** shard by **principal** (phone/email). ~15k rows → ~4k shards.
+- **Requests** shard by **principal + vendor** (`assigned_vendor_source_ids`) so the
+  same `VendorActivity`/M2M is never created twice.
+
+All rows for one principal/vendor load **sequentially** within a shard; distinct
+shards run **concurrently** on `LOAD_WORKERS` threads (pooled session, **no** POST
+auto-retry — a write that may have committed must not be resent; failures are
+captured per row and re-run idempotently). Real result: 15,151 consents in ~5.5 min
+(was ~50 min).
+
+```bash
+LOAD_WORKERS=8   # default; drop to 4 if the Flask DB shows write contention
+```
+
+> [!NOTE]
+> Requests with neither phone nor email get a shared dummy identity, so they
+> collapse into one serial shard (correct — they resolve to one principal). And
+> blank source rows (no PA) still fail with `Processing activity not found` — those
+> are unmigratable, not a load bug.
+
+### Resume / checkpointing
+
+Each enrichment pass writes a JSONL checkpoint next to the raw file
+(e.g. `data/raw/raw_consents.csv.enrich.jsonl`), flushed every 500 records. If a
+run is interrupted (token expiry, network drop, `Ctrl-C`), **re-running the same
+`enrich` command resumes** — already-fetched ids are skipped, not re-fetched. You'll
+see `Resuming consents: N/M already cached`. The checkpoint is deleted automatically
+once the enriched CSV is written successfully.
+
+### Test runs — `MAX_RECORDS`
+
+`MAX_RECORDS` (default `0` = no limit) caps extraction for quick test runs. When set,
+dashboard pagination runs **sequentially** so it can stop cleanly at the limit:
+
+```bash
+MAX_RECORDS=50 python main.py consent extract   # grab just 50 records
+python main.py consent enrich                    # enriches them (+ checkpoint)
+```
+
+> [!NOTE]
+> A `MAX_RECORDS` test run exercises the sequential pagination path. To smoke-test
+> *parallel* pagination, run without `MAX_RECORDS` against a tenant with a few
+> thousand rows.
 
 ---
 

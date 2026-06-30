@@ -24,6 +24,13 @@ in every fix and gotcha learned during the prod (tech-uat) run. Read the
   long-TTL token, or just re-run on expiry — loads are idempotent/resumable.
 - **Everything is idempotent via `migration_source_map`.** Re-running skips
   already-migrated rows (409) and retries failures. A crash is not fatal.
+- **Extraction is parallel + resumable.** Dashboard paging and the by-id
+  enrichment fan out across `ENRICH_WORKERS` threads (a pooled keep-alive session
+  with retry/backoff), turning a ~3 hr 100k pull into ~10 min. Each `enrich` pass
+  checkpoints to `data/raw/<file>.enrich.jsonl`; re-running resumes (skips fetched
+  ids) and the checkpoint auto-deletes on success. Refresh `ODOO_JWT_TOKEN` before
+  a big pull (expiry aborts the run). Lower `ENRICH_WORKERS` to 8 if Odoo 429/503s.
+  See README → *Performance & Large-Volume Extraction*.
 
 ---
 
@@ -35,6 +42,9 @@ ODOO_JWT_TOKEN=<source bearer>
 FLASK_API_BASE_URL=http://localhost:5000/api                    # write target
 FLASK_API_KEY=<dest bearer>                                     # refresh when it 401s
 FLASK_TENANT_DOMAIN=skfinance.localhost.com
+ENRICH_WORKERS=16                                               # extraction concurrency; lower to 8 if Odoo 429/503s
+LOAD_WORKERS=8                                                  # consent/request load concurrency (sharded by principal/vendor); drop to 4 on DB contention
+MAX_RECORDS=0                                                   # >0 caps extraction for test runs (forces sequential paging)
 ```
 
 All commands run from `migration/` with the venv active:
@@ -107,6 +117,15 @@ AND NOT EXISTS (SELECT 1 FROM licenses l WHERE l.tenant_id=1 AND l.license_type_
 "
 ```
 
+> [!TIP]
+> Prefer the code path over raw SQL: `migration_ext.ensure_license` now
+> **seeds-if-missing** AND raises headroom, for all modules in one idempotent
+> command (run under the dpdp_python full-deps interpreter):
+> ```bash
+> cd /home/yashaswi/Developer/dpdp_python   # or the running checkout
+> ./venv/bin/python -m migration_ext.ensure_license --tenant 1
+> ```
+
 **2c. Stakeholder role alias** — map Odoo roles to a real Flask role. Create
 `migration/data/stakeholder_role_aliases.json`:
 ```json
@@ -120,6 +139,13 @@ AND NOT EXISTS (SELECT 1 FROM licenses l WHERE l.tenant_id=1 AND l.license_type_
 ---
 
 ## Step 3 — Load entities IN THIS ORDER
+
+> [!TIP]
+> **One-shot:** `python main.py migrate-all` runs every stage below in the right
+> order (including the PA→template→backfill dance and the parallel consent/request
+> loads). Add `--user-id <id>` for a fallback request owner (optional). Aborts on
+> the first stage failure; re-run after a fix (idempotent). The manual sequence
+> below is for when you need to run or inspect a single stage.
 
 Order resolves the PA↔Template circular dependency (PA references templates;
 templates reference PAs). Load PA first (template refs deferred), then templates
