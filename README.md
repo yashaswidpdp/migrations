@@ -100,15 +100,14 @@ python main.py processing-activity run-all   # 1. Processing Activities
 python main.py template run-all              # 2. Templates (load + approve)
 
 # Transactional data (reference PAs + templates)
-python main.py consent run-all               # 3. Consents  (DPCM)
-
 # Vendors BEFORE Requests — requests resolve their assignToVendor link by the
 # vendor's contact-user name, so that user must already exist (see Vendor ↔ Request).
-python main.py vendor run-all                # 4. Vendors   (+ NDA/VRA docs)
-python main.py request run-all               # 5. Requests  (DPGR, + vendor/allottee links)
+python main.py vendor run-all                # 3. Vendors   (+ NDA/VRA docs)
 
 # Internal Stakeholders — ensure target Flask roles (or an alias file) exist FIRST
-python main.py stakeholder run-all           # 6. Internal Stakeholders (email-free)
+python main.py stakeholder run-all           # 4. Internal Stakeholders (email-free)
+python main.py consent run-all               # 5. Consents  (DPCM)
+python main.py request run-all               # 6. Requests  (DPGR, + vendor/allottee links)
 ```
 
 > [!NOTE]
