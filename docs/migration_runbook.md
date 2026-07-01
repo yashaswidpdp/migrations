@@ -42,7 +42,7 @@ ODOO_JWT_TOKEN=<source bearer>
 FLASK_API_BASE_URL=http://localhost:5000/api                    # write target
 FLASK_API_KEY=<dest bearer>                                     # refresh when it 401s
 FLASK_TENANT_DOMAIN=skfinance.localhost.com
-ENRICH_WORKERS=16                                               # extraction concurrency; lower to 8 if Odoo 429/503s
+ENRICH_WORKERS=32                                               # extraction concurrency; lower to 8/16 if Odoo 429/503s
 LOAD_WORKERS=8                                                  # consent/request load concurrency (sharded by principal/vendor); drop to 4 on DB contention
 MAX_RECORDS=0                                                   # >0 caps extraction for test runs (forces sequential paging)
 ```

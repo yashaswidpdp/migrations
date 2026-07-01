@@ -248,7 +248,7 @@ Set in `config/.env` (default `16`). Controls the thread-pool width for both the
 parallel pagination and the by-id enrichment fan-out.
 
 ```bash
-ENRICH_WORKERS=16   # default; lower to 8 if Odoo rate-limits / WAF pushes back (429/503)
+ENRICH_WORKERS=32   # default; lower to 8/16 if Odoo rate-limits / WAF pushes back (429/503)
 ```
 
 > [!IMPORTANT]

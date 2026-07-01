@@ -22,7 +22,14 @@ DATA_RAW_DIR = os.getenv("DATA_RAW_DIR", "data/raw")
 # is the migration's dominant cost. Pure I/O wait, so a thread pool gives a
 # near-linear speedup. Start conservative (server rate-limit / WAF); raise if
 # the Odoo side tolerates it.
-ENRICH_WORKERS = int(os.getenv("ENRICH_WORKERS", 16))
+ENRICH_WORKERS = int(os.getenv("ENRICH_WORKERS", 32))
+# The by-id enrichment caches every fetched record in a JSONL file next to the raw
+# CSV and KEEPS it across runs (Odoo is read-only/frozen during a migration, so the
+# by-id payload for a given id doesn't change). A repeat run therefore re-reads the
+# cache and does ZERO fetches — turning a ~7 min enrich into seconds. Set
+# ENRICH_REFRESH=1 to discard the cache and re-pull from Odoo (use after the source
+# actually changes).
+ENRICH_REFRESH = os.getenv("ENRICH_REFRESH", "0").strip().lower() in ("1", "true", "yes")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -369,13 +376,17 @@ def _enrich_ids(extractor, endpoint, result_key, ids, checkpoint_path, label):
 
     Returns {id: rec_dict} covering every id in `ids` (missing/failed -> {}).
 
-    Resume: the checkpoint is a JSONL file (one `{"id":.., "rec":..}` per line).
-    On entry, ids already in the file are loaded and skipped, so a run killed at
-    record 90k (token expiry, network drop, crash) resumes instead of re-fetching
-    from zero. ex.map preserves submission order, so the main thread owns every
-    file write — no lock needed. The caller removes the checkpoint only after the
-    enriched CSV is safely written.
+    Persistent cache + resume: the checkpoint is a JSONL file (one
+    `{"id":.., "rec":..}` per line). On entry, ids already in the file are loaded
+    and skipped — so this both RESUMES a killed run AND skips re-fetching across
+    separate runs (the file is kept, not deleted, since Odoo is frozen during a
+    migration). A repeat enrich with a full cache does zero HTTP. ex.map preserves
+    submission order, so the main thread owns every file write — no lock needed.
+    Set ENRICH_REFRESH=1 to discard the cache and re-pull.
     """
+    if ENRICH_REFRESH and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        logger.info(f"{label}: ENRICH_REFRESH set — discarded cache {checkpoint_path}")
     cache = {}
     if os.path.exists(checkpoint_path):
         with open(checkpoint_path, "r", encoding="utf-8") as fh:
@@ -488,9 +499,8 @@ def run_request_enrichment(raw_file: str = "raw_requests.csv"):
     for col in byid_cols:
         df[col] = extra[col]
     df.to_csv(path, index=False)
-    # CSV is safely written -> drop the resume checkpoint.
-    if os.path.exists(checkpoint):
-        os.remove(checkpoint)
+    # Keep the enrichment cache (do NOT delete) so a repeat run skips re-fetching.
+    # Use ENRICH_REFRESH=1 to force a fresh pull.
     filled = sum(1 for x in request_types if x)
     vfilled = sum(1 for x in assign_to_vendors if x)
     logger.info(f"Request enrichment done: {filled}/{len(df)} rows carry requestType, "
@@ -565,9 +575,8 @@ def run_consent_enrichment(raw_file: str = "raw_consents.csv"):
                 df.loc[idx, csv_col] = byid_val
 
     df.to_csv(path, index=False)
-    # CSV is safely written -> drop the resume checkpoint.
-    if os.path.exists(checkpoint):
-        os.remove(checkpoint)
+    # Keep the enrichment cache (do NOT delete) so a repeat run skips re-fetching.
+    # Use ENRICH_REFRESH=1 to force a fresh pull.
     logger.info(f"Consent enrichment done: backfilled userActivityType on {filled} rows. Updated {path}")
 
 
