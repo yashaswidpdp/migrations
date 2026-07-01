@@ -116,7 +116,11 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
         logger.error(f"Input file not found: {input_path}")
         return
 
-    df = pd.read_csv(input_path)
+    # phone as string: pandas would otherwise infer the column as float (blanks
+    # present) and turn '0025520778' into 25520778.0, losing the leading zeros
+    # BEFORE _clean_phone runs. dtype=str preserves the exact source digits;
+    # pandas ignores the key when the CSV has no phone column.
+    df = pd.read_csv(input_path, dtype={"phone": str})
     logger.info(f"Loaded {len(df)} records for transformation.")
 
     transformed_records = []
@@ -139,10 +143,34 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 if isinstance(item, dict) and item.get("id")
             ]
 
-            # Assignee is a Flask user_id supplied at transform time (the same
-            # backend user runs the migration / owns these requests). Emitted as
-            # an ID list so the loader can pass it straight to /request/create's
-            # `assigned_users` field.
+            # Vendor<->request "activity" link from /dpgr/id `assignToVendor`
+            # (the vendor handling this request). Carries the Odoo id + display
+            # name; emit BOTH so the backend can resolve via the vendor / vendor-
+            # user source-map (the id is a vendor-CONTACT id, not the vendor
+            # company id, so name is kept as a resolution fallback).
+            vendor_raw = parse_dict_list_string(row.get("assignToVendor"))
+            assigned_vendor_source_ids = [
+                item.get("id") for item in vendor_raw
+                if isinstance(item, dict) and item.get("id")
+            ]
+            assigned_vendor_names = [
+                str(item.get("name")).strip() for item in vendor_raw
+                if isinstance(item, dict) and item.get("name")
+            ]
+
+            # Real internal allottee ("assigned/not assigned" state). Previously
+            # lost: assigned_users was only the CLI fallback id. `assignToDM`
+            # carries the actual Data-Manager the request was allotted to; emit
+            # the NAME(s) so the loader resolves them to Flask user ids via the
+            # backend-user catalogue (mirrors PA manager resolution).
+            dm_raw = parse_dict_list_string(row.get("assignToDM"))
+            assigned_user_names = [
+                str(item.get("name")).strip() for item in dm_raw
+                if isinstance(item, dict) and item.get("name")
+            ]
+
+            # CLI-supplied Flask user_id fallback (the backend user running the
+            # migration), used when the source carries no internal allottee.
             assigned_users = [int(assigned_user_id)] if assigned_user_id else []
 
             email = str(row.get("eMail", "")).strip()
@@ -165,7 +193,17 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 "request_type_name": parse_request_type_name(row.get("requestType")),
                 "processing_activity_names": processing_activity_names,
                 "consent_source_ids": consent_source_ids,
+                # Vendor<->request activity link (resolved backend-side via the
+                # vendor source-map; name kept as fallback). Empty when the
+                # request was never assigned to a vendor.
+                "assigned_vendor_source_ids": assigned_vendor_source_ids,
+                "assigned_vendor_names": assigned_vendor_names,
+                # Internal allottee name(s) -> loader resolves to Flask user ids.
+                "assigned_user_names": assigned_user_names,
                 "assigned_users": assigned_users,
+                # Allotment state + when, straight from trackAssigneeStatus.
+                "assignee_status": str(row.get("assignee_status", "") or "").strip(),
+                "assignee_raised_on": to_iso_datetime(row.get("assignee_raised_on")),
                 "status": map_request_status(row.get("status", "Not Assigned")),
                 "rag_status": map_rag_status(row.get("ragStatus", "Green")),
                 # Odoo ragStatus -> Flask Request.risk (High/Medium/Low; "" for
@@ -176,6 +214,7 @@ def transform_request_data(input_filename: str, output_filename: str, assigned_u
                 # the backend parses them with datetime.fromisoformat; "" lets
                 # the backend keep its own default (now).
                 "raised_on": to_iso_datetime(row.get("createOn")),
+                "action_date": to_iso_datetime(row.get("actionDate")),
                 "resolution_date": to_iso_datetime(row.get("resolutionDate")),
                 "closed_on": to_iso_datetime(row.get("closedOn")),
                 # Free-text + escalation + close fields -> Flask Request columns

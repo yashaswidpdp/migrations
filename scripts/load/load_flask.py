@@ -6,8 +6,11 @@ import logging
 import ast
 import base64
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 import openpyxl
 from typing import Optional
 
@@ -21,6 +24,11 @@ load_dotenv("config/.env")
 FLASK_API_BASE_URL = os.getenv("FLASK_API_BASE_URL")
 FLASK_API_KEY = os.getenv("FLASK_API_KEY")
 DATA_PROCESSED_DIR = os.getenv("DATA_PROCESSED_DIR", "data/processed")
+# Concurrency for the consent load. Writes are sharded by principal (same
+# principal never written by two workers at once), so this is the number of
+# *distinct principals* loaded in parallel. Kept lower than the read-side
+# ENRICH_WORKERS because each request does DB work + a commit. Tune per server.
+LOAD_WORKERS = int(os.getenv("LOAD_WORKERS", 16))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +47,47 @@ class FlaskLoader:
         tenant_domain = os.getenv("FLASK_TENANT_DOMAIN")
         if tenant_domain:
             self.headers["Host"] = tenant_domain.strip()
+        # Pooled keep-alive session shared across loader threads. NO status
+        # retries: a POST that times out *after* the server committed must not be
+        # auto-resent (it would double-insert); failures are captured per row and
+        # re-run idempotently instead. Pool sized to cover LOAD_WORKERS.
+        pool = max(LOAD_WORKERS, 16)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=0)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def _record_source_map(self, entity, odoo_id, flask_id, sub_key=""):
+        """Record an odoo->flask mapping in the migration ledger for entities
+        created via the native routes (processing_activity, template), so they
+        become idempotent + auditable like the /migration/* entities.
+
+        Best-effort: a recorder failure is logged, never fatal to the load. The
+        endpoint is idempotent (200 'exists' when already recorded)."""
+        if not odoo_id or flask_id is None:
+            return
+        try:
+            resp = requests.post(
+                f"{self.base_url}/migration/source-map",
+                headers=self.headers,
+                json={
+                    "entity": entity,
+                    "odoo_source_id": int(odoo_id),
+                    "flask_id": int(flask_id),
+                    "sub_key": sub_key or "",
+                },
+                timeout=30,
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"source-map record failed {entity} {odoo_id}->{flask_id}: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except (TypeError, ValueError): 
+            logger.warning(f"source-map skip {entity}: bad ids {odoo_id}->{flask_id}")
+        except Exception as e:
+            logger.warning(f"source-map record exception {entity} {odoo_id}: {e}")
 
     def load_from_csv(self, csv_filename: str, endpoint: str):
         input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
@@ -46,19 +95,26 @@ class FlaskLoader:
             logger.error(f"Input CSV not found: {input_path}")
             return
 
-        df = pd.read_csv(input_path)
+        # Force `phone` to read as string. pandas otherwise infers the column as
+        # float64 whenever blanks are present, turning '9878987819' into the float
+        # 9878987819.0; the row-level NaN->None guard below only nulls true NaNs,
+        # so a non-blank phone would reach the API as '9878987819.0' (the trailing
+        # '.0' then lands in Flask). dtype=str preserves the exact digits (and any
+        # leading zero); pandas ignores the key for CSVs that have no phone column.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         logger.info(f"Loaded {len(df)} records from {csv_filename}")
 
-        success_count = 0
-        failure_rows = []
         error_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
 
         pa_map = self._resolve_pa_ids()
         default_request_type_id = self._resolve_request_type_id()
         request_type_map = self._resolve_request_type_map()
 
-        for index, row in df.iterrows():
-            record_data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
+        def _prepare(row_dict):
+            """Build the POST body for one row (PA/request-type resolution,
+            assigned_users parse, phone/email synthesis). Unchanged from the old
+            per-row prep — just lifted out so it runs before the parallel phase."""
+            record_data = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row_dict.items()}
 
             pa_name = record_data.get("processing_activity_name")
             if pa_name:
@@ -115,51 +171,67 @@ class FlaskLoader:
             record_data.pop("processing_activity_names", None)
             record_data.pop("assigned_user_names", None)
             record_data.pop("manager_name", None)
+            return record_data
 
+        records = [_prepare(row.to_dict()) for _i, row in df.iterrows()]
+        total = len(records)
+
+        # Shard on principal AND vendor so neither the same data principal
+        # (phone/email) nor the same vendor (the VendorActivity/M2M the server
+        # creates) is written by two workers at once. Sharding runs on the
+        # PREPARED records, so the synthesized phone/email are what's keyed (same
+        # identity the server resolves). Distinct shards run in parallel.
+        shards = self._shard_by_keys(records, [self._phone_key, self._email_key, self._vendor_keys])
+        logger.info(f"{total} records grouped into {len(shards)} shards; loading with {LOAD_WORKERS} workers.")
+
+        success_count = 0
+        failure_rows = []
+        done = 0
+        lock = threading.Lock()
+
+        def _post(record_data, label):
             try:
-                response = requests.post(
-                    f"{self.base_url}{endpoint}",
-                    headers=self.headers,
-                    json=record_data,
-                    timeout=30,
-                )
-
-                # Identity-conflict retry: a 409 mentioning "Data Principal"
-                # means the carried phone resolves to a DIFFERENT principal than
-                # the email (shared dummy numbers in the source). Re-key by email
-                # alone so the request still attaches to the right person. A 409
+                response = self.session.post(f"{self.base_url}{endpoint}", json=record_data, timeout=30)
+                # Identity-conflict retry: a 409 mentioning "Data Principal" means
+                # the carried phone resolves to a DIFFERENT principal than the
+                # email (shared dummy numbers). Re-key by email alone. A 409
                 # WITHOUT that phrase is the idempotent "already migrated" case.
-                if (
-                    response.status_code == 409
-                    and record_data.get("phone")
-                    and "data principal" in response.text.lower()
-                ):
+                if (response.status_code == 409 and record_data.get("phone")
+                        and "data principal" in response.text.lower()):
                     retry = {k: v for k, v in record_data.items() if k != "phone"}
-                    logger.warning(
-                        f"Record {index + 1}: phone collided with another principal; "
-                        f"retrying email-only."
-                    )
-                    response = requests.post(
-                        f"{self.base_url}{endpoint}",
-                        headers=self.headers,
-                        json=retry,
-                        timeout=30,
-                    )
+                    logger.warning(f"Record {label}: phone collided with another principal; retrying email-only.")
+                    response = self.session.post(f"{self.base_url}{endpoint}", json=retry, timeout=30)
 
-                if response.status_code in [200, 201]:
-                    logger.info(f"Loaded record {index + 1}/{len(df)}")
-                    success_count += 1
-                elif response.status_code == 409 and "data principal" not in response.text.lower():
-                    # Genuinely already migrated (source-map hit) — idempotent skip.
-                    logger.info(f"Record {index + 1} already migrated. Skipping.")
-                    success_count += 1
-                else:
-                    logger.error(f"Failed record {index + 1}: {response.status_code} - {response.text}")
+                if response.status_code in (200, 201):
+                    return True
+                if response.status_code == 409 and "data principal" not in response.text.lower():
+                    return True  # genuinely already migrated (source-map hit) — idempotent skip
+                with lock:
                     failure_rows.append({**record_data, "error_message": response.text, "status_code": response.status_code})
-
+                logger.error(f"Failed record {label}: {response.status_code} - {response.text[:300]}")
+                return False
             except Exception as e:
-                logger.error(f"Exception loading record {index + 1}: {e}")
-                failure_rows.append({**record_data, "error_message": str(e)})
+                with lock:
+                    failure_rows.append({**record_data, "error_message": str(e)})
+                logger.error(f"Exception loading record {label}: {e}")
+                return False
+
+        def _process_shard(idx_list):
+            """One shard (same principal/vendor) — sequential so the server never
+            races to create the same principal or VendorActivity twice."""
+            nonlocal success_count, done
+            ok = 0
+            for i in idx_list:
+                if _post(records[i], f"{i + 1}/{total}"):
+                    ok += 1
+            with lock:
+                success_count += ok
+                prev, done = done, done + len(idx_list)
+                if done // 500 != prev // 500 or done == total:
+                    logger.info(f"Loaded {done}/{total} records ({success_count} ok, {len(failure_rows)} failed)...")
+
+        with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as ex:
+            list(ex.map(_process_shard, shards))
 
         if failure_rows:
             pd.DataFrame(failure_rows).to_csv(error_file, index=False)
@@ -177,7 +249,9 @@ class FlaskLoader:
         if not os.path.exists(input_path):
             logger.error(f"Vendor CSV not found: {input_path}")
             return
-        df = pd.read_csv(input_path)
+        # phone as string — see load_from_csv: avoids the float '...0' artifact a
+        # blank-bearing phone column otherwise gets, which would land in Flask.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         logger.info(f"Loaded {len(df)} vendor records from {csv_filename}")
 
         pa_map = self._resolve_pa_ids()
@@ -229,7 +303,7 @@ class FlaskLoader:
                     skipped += 1
                 else:
                     # Real failure — incl. "Vendor already exists for user"
-                    # (a different Odoo vendor sharing this contact user). Surface
+                    # (a different Odoo vendor sharing this contact user). Surface  
                     # it, never silently count as success.
                     logger.error(f"Failed vendor '{data.get('company_name')}': {resp.status_code} - {resp.text[:300]}")
                     failure_rows.append({**data, "error_message": resp.text, "status_code": resp.status_code})
@@ -305,22 +379,34 @@ class FlaskLoader:
     def _resolve_request_type_map(self) -> dict:
         """Map every Flask request type name (lower-cased) -> id, so an enriched
         Odoo `requestType` name resolves to the right id instead of a hardcoded
-        default. Mirrors the PA / template name->id resolution."""
+        default. Mirrors the PA / template name->id resolution.
+
+        GET /request-types/ paginates (default 10/page, max 100), so page through
+        ALL pages — a single call only sees the first page and silently drops
+        types whose names live further down (e.g. lowest ids under id-desc sort)."""
         name_to_id = {}
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/request-types/",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
+            while True:
+                response = requests.get(
+                    f"{self.base_url}/request-types/",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 100},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
                 body = response.json()
                 data = body.get("data", {})
                 records = data.get("records", []) if isinstance(data, dict) else data
-                if isinstance(records, list):
-                    for r in records:
-                        if isinstance(r, dict) and "name" in r and "id" in r:
-                            name_to_id[str(r["name"]).strip().lower()] = r["id"]
+                if not isinstance(records, list) or not records:
+                    break
+                for r in records:
+                    if isinstance(r, dict) and "name" in r and "id" in r:
+                        name_to_id[str(r["name"]).strip().lower()] = r["id"]
+                if len(records) < 100:
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not build request-type name map: {e}")
         return name_to_id
@@ -371,6 +457,66 @@ class FlaskLoader:
                 logger.error(f"Exception creating request type '{name}': {e}")
                 failed += 1
         logger.info(f"Request-type seed summary: {created} created, {skipped} skipped, {failed} failed.")
+
+    def load_request_types(self, json_file: str = "processed_request_types.json"):
+        """Load transformed Odoo request types (data/processed) into Flask.
+        New names -> POST /request-types/create; names already present ->
+        PUT /request-types/<id> so re-runs propagate SLA/flag fixes instead of
+        skipping (create never touches an existing record). Idempotent: re-running
+        with the same payload is a no-op update. Must run before consent + request
+        loads so request_type_name resolves."""
+        path = os.path.join(DATA_PROCESSED_DIR, json_file)
+        if not os.path.exists(path):
+            logger.error(f"Processed request-type file not found: {path}")
+            return
+        with open(path, encoding="utf-8") as f:
+            payloads = json.load(f)
+
+        existing = self._resolve_request_type_map()  # name(lower) -> id
+        created = updated = failed = 0
+        for p in payloads:
+            name = str(p.get("name", "")).strip()
+            if not name:
+                continue
+            rt_id = existing.get(name.lower())
+            if rt_id is not None:
+                # Already present: PUT the payload so SLA-model changes land on the
+                # existing record. Backend updates only the fields we send and
+                # leaves the rest (e.g. is_active) untouched.
+                try:
+                    resp = requests.put(
+                        f"{self.base_url}/request-types/{rt_id}",
+                        headers=self.headers,
+                        json=p,
+                        timeout=30,
+                    )
+                    if resp.status_code in (200, 201):
+                        logger.info(f"Updated request type '{name}' (id={rt_id}).")
+                        updated += 1
+                    else:
+                        logger.error(f"Failed to update request type '{name}' (id={rt_id}): {resp.status_code} - {resp.text}")
+                        failed += 1
+                except Exception as e:
+                    logger.error(f"Exception updating request type '{name}' (id={rt_id}): {e}")
+                    failed += 1
+                continue
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/request-types/create",
+                    headers=self.headers,
+                    json=p,
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    logger.info(f"Created request type '{name}'.")
+                    created += 1
+                else:
+                    logger.error(f"Failed to create request type '{name}': {resp.status_code} - {resp.text}")
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Exception creating request type '{name}': {e}")
+                failed += 1
+        logger.info(f"Request-type load summary: {created} created, {updated} updated, {failed} failed.")
 
     def _resolve_user_ids(self) -> dict:
         """Fetch all backend users from Flask and map their names to user IDs."""
@@ -478,6 +624,12 @@ class FlaskLoader:
             if name in name_to_id:
                 logger.info(f"PA '{name}' already exists (id={name_to_id[name]}). Skipping.")
                 skip_count += 1
+                # Backfill the ledger for an already-loaded PA (mirrors the
+                # template loader) so a re-run records previously-loaded rows
+                # the up-front _resolve_pa_ids() map would otherwise early-skip.
+                self._record_source_map(
+                    "processing_activity", row.get("odoo_id"), name_to_id[name]
+                )
                 continue
 
             parent_name = row.get("parent_name")
@@ -549,12 +701,18 @@ class FlaskLoader:
                     if new_id:
                         name_to_id[name] = new_id
                     logger.info(f"Created PA '{name}' (id={new_id})")
+                    # Ledger the mapping so PA loads are idempotent + auditable.
+                    self._record_source_map("processing_activity", row.get("odoo_id"), new_id)
                     success_count += 1
                 elif response.status_code == 400 and "already exists" in response.text.lower():
                     logger.info(f"PA '{name}' already exists. Skipping.")
                     skip_count += 1
                     # Refresh map so children can resolve this parent
                     name_to_id = self._resolve_pa_ids()
+                    # Record the existing PA too, so a re-run backfills the ledger.
+                    self._record_source_map(
+                        "processing_activity", row.get("odoo_id"), name_to_id.get(name)
+                    )
                 else:
                     logger.error(f"Failed PA '{name}': {response.status_code} - {response.text[:300]}")
                     failure_count += 1
@@ -699,6 +857,9 @@ class FlaskLoader:
 
         # Pre-fetch existing template names to skip duplicates
         existing_names = self._fetch_existing_template_names()
+        # name -> flask id, used to ledger templates that already exist (so a
+        # re-run backfills the source-map for previously-loaded templates).
+        existing_template_ids = self._fetch_template_id_map()
         pa_map = self._resolve_pa_ids()
 
         # name -> Flask id captured from each create response, so a follow-up
@@ -717,6 +878,13 @@ class FlaskLoader:
             if name in existing_names:
                 logger.info(f"Template '{name}' already exists. Skipping.")
                 skip_count += 1
+                # Backfill the ledger for an already-loaded template.
+                tmpl_sub_key = "|".join(str(row.get(c) or "") for c in
+                                        ("template_type", "sub_type", "language"))
+                self._record_source_map(
+                    "template", row.get("odoo_id"),
+                    existing_template_ids.get(name), sub_key=tmpl_sub_key,
+                )
                 continue
 
             pa_names_str = row.get("processing_activity_names")
@@ -769,6 +937,14 @@ class FlaskLoader:
                     if new_id:
                         created_ids[name] = new_id
                     logger.info(f"Created template '{name}' (id={new_id})")
+                    # Ledger every emitted template row under its Odoo source id.
+                    # sub_key discriminates fan-out (same odoo_id across multiple
+                    # type/channel/language rows) so each lands a distinct mapping.
+                    tmpl_sub_key = "|".join(str(row.get(c) or "") for c in
+                                            ("template_type", "sub_type", "language"))
+                    self._record_source_map(
+                        "template", row.get("odoo_id"), new_id, sub_key=tmpl_sub_key
+                    )
                     success_count += 1
                     existing_names.add(name)
                 else:
@@ -783,6 +959,84 @@ class FlaskLoader:
             f"{skip_count} skipped, {failure_count} failed."
         )
         return created_ids
+
+    def patch_template_pa_links(self, csv_filename: str = "processed_templates.csv"):
+        """Backfill processing-activity links onto templates ALREADY in Flask.
+
+        Re-runnable. The create pass only links PAs if pa_map was complete at
+        create time; templates created earlier (incomplete pa_map / before PAs)
+        end up with no PA link. This re-resolves the names against the full pa_map
+        and PUTs `processing_activity_ids` onto each existing template. Idempotent
+        (PUT replaces the M2M). Skips DEFAULT templates (they cannot carry PAs).
+        Requires the PUT plural-key fix in notice_template/crud.py."""
+        input_path = os.path.join(DATA_PROCESSED_DIR, csv_filename)
+        if not os.path.exists(input_path):
+            logger.error(f"CSV not found: {input_path}")
+            return 0
+
+        df = pd.read_csv(input_path)
+        df = df.where(pd.notnull(df), None)
+        name_to_id = self._fetch_template_id_map()   # paginated, full
+        pa_map = self._resolve_pa_ids()              # paginated + full endpoint
+        logger.info(
+            f"patch_template_pa_links: {len(name_to_id)} templates, {len(pa_map)} PAs resolved."
+        )
+
+        patched = skipped = failed = 0
+        for _, row in df.iterrows():
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            if bool(row.get("is_default", False)):
+                skipped += 1                          # default templates carry no PA
+                continue
+
+            pa_names_str = row.get("processing_activity_names")
+            if not pa_names_str:
+                skipped += 1
+                continue
+            try:
+                if isinstance(pa_names_str, str) and pa_names_str.startswith("["):
+                    pa_names = ast.literal_eval(pa_names_str)
+                elif isinstance(pa_names_str, str):
+                    pa_names = [pa_names_str]
+                else:
+                    pa_names = list(pa_names_str)
+            except Exception:
+                pa_names = []
+            pa_ids = [pa_map[n.strip()] for n in pa_names if str(n).strip() in pa_map]
+            if not pa_ids:
+                skipped += 1
+                continue
+
+            tid = name_to_id.get(name)
+            if not tid:
+                logger.warning(f"patch_template_pa_links: template '{name}' not in Flask; skipping.")
+                failed += 1
+                continue
+            try:
+                resp = requests.put(
+                    f"{self.base_url}/notice-templates/{tid}",
+                    headers=self.headers,
+                    json={"processing_activity_ids": pa_ids},
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    patched += 1
+                else:
+                    logger.error(
+                        f"patch_template_pa_links '{name}' (id={tid}): "
+                        f"{resp.status_code} - {resp.text[:200]}"
+                    )
+                    failed += 1
+            except Exception as e:
+                logger.error(f"patch_template_pa_links '{name}': {e}")
+                failed += 1
+
+        logger.info(
+            f"Template PA-link patch: {patched} patched, {skipped} skipped, {failed} failed."
+        )
+        return patched
 
     def approve_templates(self, csv_filename: str, id_map: dict = None):
         """Activate templates that were loaded as Draft.
@@ -893,47 +1147,84 @@ class FlaskLoader:
         return name_to_id
 
     def _fetch_existing_template_names(self) -> set:
-        """Fetch all template names already in Flask for the active tenant."""
+        """Every template name already in Flask, across ALL pages and statuses.
+
+        `GET /notice-templates/` paginates at default_per_page=10 — reading only
+        the first response (the old behavior) recognized just 10 of ~190 names, so
+        every re-run RE-CREATED the rest as duplicates (each duplicate default then
+        archived the prior one). Walk every page with a large per_page so the
+        skip-if-exists check is genuinely idempotent. No status filter is passed,
+        so Draft/Active/Archive are all included (an archived template's name is
+        still taken — don't recreate it)."""
+        names: set = set()
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/notice-templates/",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
-                body = response.json()
-                data = body.get("data", {})
-                records = data.get("templates", data.get("records", []))
-                if isinstance(records, list):
-                    return {r["name"] for r in records if isinstance(r, dict) and "name" in r}
+            while page <= 1000:                      # hard cap; bad pager can't loop forever
+                response = requests.get(
+                    f"{self.base_url}/notice-templates/",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 200},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
+                data = response.json().get("data", {})
+                if isinstance(data, dict):
+                    records = data.get("templates", data.get("records", []))
+                    pag = data.get("pagination", {}) or {}
+                else:
+                    records = data if isinstance(data, list) else []
+                    pag = {}
+                for r in records:
+                    if isinstance(r, dict) and "name" in r:
+                        names.add(r["name"])
+                total_pages = pag.get("totalPages")
+                has_next = pag.get("hasNext")
+                if not records or has_next is False or (total_pages and page >= int(total_pages)):
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not fetch existing templates: {e}")
-        return set()
+        return names
 
     def _resolve_pa_ids(self) -> dict:
+        """name -> Flask PA id, across ALL pages. The endpoint paginates (50/page),
+        so reading only page 1 silently drops PAs on later pages -> every consent /
+        template / request that references a missing PA fails 'PA not found' or
+        loses its PA link. Walk every page using the pagination meta."""
+        # Use the FULL /processing/activities endpoint, not /simple: /simple omits
+        # INACTIVE PAs, but historical consents/requests still reference them (e.g.
+        # a deactivated 'Testing' activity) and must resolve. Walk every page.
+        out: dict = {}
+        page = 1
         try:
-            response = requests.get(
-                f"{self.base_url}/processing/activities/simple",
-                headers=self.headers,
-                timeout=30,
-            )
-            if response.status_code == 200:
-                body = response.json()
-                data = body.get("data", {})
-                records = []
+            while page <= 1000:                      # hard cap; bad pager can't loop forever
+                response = requests.get(
+                    f"{self.base_url}/processing/activities",
+                    headers=self.headers,
+                    params={"page": page, "per_page": 100},
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    break
+                data = response.json().get("data", {})
                 if isinstance(data, dict):
                     records = data.get("records", [])
-                elif isinstance(data, list):
-                    records = data
-                if isinstance(records, list):
-                    return {
-                        pa["name"]: pa["id"]
-                        for pa in records
-                        if isinstance(pa, dict) and "name" in pa and "id" in pa
-                    }
+                    pag = data.get("pagination", {}) or {}
+                else:
+                    records = data if isinstance(data, list) else []
+                    pag = {}
+                for pa in records:
+                    if isinstance(pa, dict) and "name" in pa and "id" in pa:
+                        out[pa["name"]] = pa["id"]
+                total_pages = pag.get("totalPages")
+                has_next = pag.get("hasNext")
+                if not records or has_next is False or (total_pages and page >= int(total_pages)):
+                    break
+                page += 1
         except Exception as e:
             logger.warning(f"Could not fetch PA list from Flask API: {e}")
-        return {}
+        return out
 
     # Map a ProcessingTypeEnum *value* to the enum *member name* the Flask
     # importer's parse_form_data() looks up (ProcessingTypeEnum[NAME.upper()]).
@@ -1217,6 +1508,92 @@ class FlaskLoader:
 
         stakeholder_report.write_report(results, csv_filename)
 
+    @staticmethod
+    def _shard_by_keys(records, key_funcs):
+        """Union-find sharder: group row indices so any two rows that share a key
+        land in the same shard. `key_funcs` is a list of callables (row -> iterable
+        of hashable keys); each func has its OWN namespace, so a phone and a vendor
+        id that happen to be equal never merge. Returns a list of index-lists; each
+        list is processed sequentially, distinct lists run in parallel. Rows that
+        produce no keys are singletons.
+
+        Used to keep writes that touch the same server-side entity serial: consent
+        load shards by principal (phone/email); request load also shards by vendor
+        (assigned_vendor_source_ids) so the same VendorActivity/M2M is never
+        created by two workers at once.
+        """
+        n = len(records)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        first = {}  # (func_index, key) -> first row index seen
+        for i, rec in enumerate(records):
+            for fi, kf in enumerate(key_funcs):
+                for k in kf(rec):
+                    if not k:
+                        continue
+                    nk = (fi, k)
+                    if nk in first:
+                        union(i, first[nk])
+                    else:
+                        first[nk] = i
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return list(groups.values())
+
+    @staticmethod
+    def _phone_key(rec):
+        return [str(rec.get("phone") or "").strip()]
+
+    @staticmethod
+    def _email_key(rec):
+        return [str(rec.get("email") or "").strip().lower()]
+
+    @staticmethod
+    def _vendor_keys(rec):
+        """Keys identifying the vendor(s) a request creates a VendorActivity/M2M
+        for, so two requests touching the same vendor stay in one shard (serial).
+
+        Emits BOTH the Odoo vendor id (`v<id>`) AND the normalized vendor name
+        (`n<name>`). The id is the stable source identity, but the BACKEND resolves
+        vendors by NAME (Vendor.company_name / User.name), and some requests carry
+        a name with no source id — so keying on name too closes the gap where two
+        same-vendor requests would otherwise land in different shards and race on
+        the VendorActivity create. Both live in this one key namespace, so sharing
+        either an id or a name groups the rows. Parses defensively."""
+        def _parse(val):
+            if not val:
+                return []
+            try:
+                return ast.literal_eval(val) if isinstance(val, str) else list(val)
+            except Exception:
+                return []
+
+        keys = [f"v{v}" for v in _parse(rec.get("assigned_vendor_source_ids"))]
+        keys += [
+            f"n{str(name).strip().lower()}"
+            for name in _parse(rec.get("assigned_vendor_names"))
+            if str(name).strip()
+        ]
+        return keys
+
+    @classmethod
+    def _shard_by_principal(cls, records):
+        """Consent sharding: same principal (phone OR email) stays serial."""
+        return cls._shard_by_keys(records, [cls._phone_key, cls._email_key])
+
     def load_consents_via_migration(self, csv_filename: str):
         """Load consents (paper + legacy together) via the migration extension
         endpoint /migration/consent, one JSON record per row.
@@ -1232,7 +1609,11 @@ class FlaskLoader:
             logger.error(f"Consent CSV not found: {input_path}")
             return
 
-        df = pd.read_csv(input_path)
+        # phone as string (matches the request + vendor loaders): without this,
+        # pandas infers a blank-bearing phone column as float64, so '08800865195'
+        # becomes 8800865195.0 — leading zero lost, trailing '.0' added — and that
+        # corrupted value reaches Flask. dtype=str preserves the exact digits.
+        df = pd.read_csv(input_path, dtype={"phone": str})
         if df.empty:
             logger.info("No consent records to load.")
             return
@@ -1240,22 +1621,34 @@ class FlaskLoader:
         logger.info(f"Loaded {len(df)} consent records from {csv_filename}")
         pa_map = self._resolve_pa_ids()
 
-        success = 0
-        failures = []
-        for index, row in df.iterrows():
+        # Prepare every record up front (PA resolution etc.) so the parallel
+        # phase only does HTTP.
+        records = []
+        for _index, row in df.iterrows():
             record = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.to_dict().items()}
-
             pa_name = record.get("processing_activity_name")
             if pa_name:
                 record["processing_activity_id"] = pa_map.get(str(pa_name).strip())
             record.pop("manager_name", None)
+            records.append(record)
 
+        total = len(records)
+        shards = self._shard_by_principal(records)
+        logger.info(f"{total} consents grouped into {len(shards)} principal shards; "
+                    f"loading with {LOAD_WORKERS} workers.")
+
+        success = 0
+        failures = []
+        done = 0
+        lock = threading.Lock()
+
+        def _post_consent(record, label):
+            """POST one consent. Returns True if ok/already-migrated, else appends
+            to `failures` and returns False. Mirrors the original per-row logic
+            (phone-collision -> email-only retry)."""
             try:
-                response = requests.post(
-                    f"{self.base_url}/migration/consent",
-                    headers=self.headers,
-                    json=record,
-                    timeout=60,
+                response = self.session.post(
+                    f"{self.base_url}/migration/consent", json=record, timeout=60,
                 )
                 # An identity collision on phone (the consent's principal shares a
                 # phone with a different existing principal) must NOT be swallowed
@@ -1263,26 +1656,43 @@ class FlaskLoader:
                 # attaches, mirroring the vendor loader.
                 if response.status_code == 409 and record.get("phone") and "phone" in response.text.lower():
                     retry = {k: v for k, v in record.items() if k != "phone"}
-                    logger.warning(f"Consent {index + 1}: phone collided with another principal; retrying email-only.")
-                    response = requests.post(
-                        f"{self.base_url}/migration/consent",
-                        headers=self.headers, json=retry, timeout=60,
+                    logger.warning(f"Consent {label}: phone collided with another principal; retrying email-only.")
+                    response = self.session.post(
+                        f"{self.base_url}/migration/consent", json=retry, timeout=60,
                     )
 
                 if response.status_code in (200, 201):
-                    logger.info(f"Loaded consent {index + 1}/{len(df)}")
-                    success += 1
-                elif response.status_code == 409 and "already migrated" in response.text.lower():
+                    return True
+                if response.status_code == 409 and "already migrated" in response.text.lower():
                     # True idempotent skip — the source-map already has this consent.
-                    logger.info(f"Consent {index + 1} already migrated. Skipping.")
-                    success += 1
-                else:
-                    # Real failure (incl. unrecoverable 409s, 400s). Never count as ok.
-                    logger.error(f"Consent {index + 1} failed: {response.status_code} - {response.text[:300]}")
+                    return True
+                # Real failure (incl. unrecoverable 409s, 400s). Never count as ok.
+                with lock:
                     failures.append({**record, "error": response.text, "status_code": response.status_code})
+                logger.error(f"Consent {label} failed: {response.status_code} - {response.text[:300]}")
+                return False
             except Exception as e:
-                logger.exception(f"Exception loading consent {index + 1}: {e}")
-                failures.append({**record, "error": str(e)})
+                with lock:
+                    failures.append({**record, "error": str(e)})
+                logger.exception(f"Exception loading consent {label}: {e}")
+                return False
+
+        def _process_shard(idx_list):
+            """All consents for one principal — run sequentially so the server
+            never races to create the same principal twice."""
+            nonlocal success, done
+            ok = 0
+            for i in idx_list:
+                if _post_consent(records[i], f"{i + 1}/{total}"):
+                    ok += 1
+            with lock:
+                success += ok
+                prev, done = done, done + len(idx_list)
+                if done // 500 != prev // 500 or done == total:
+                    logger.info(f"Loaded {done}/{total} consents ({success} ok, {len(failures)} failed)...")
+
+        with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as ex:
+            list(ex.map(_process_shard, shards))
 
         err_file = os.path.join(DATA_PROCESSED_DIR, f"errors_{csv_filename}")
         if failures:
@@ -1302,6 +1712,10 @@ def run_loading(csv_filename: str, endpoint: str):
 
 def run_request_type_seeding(seed_file: str = "request_types_seed.json"):
     FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).seed_request_types(seed_file)
+
+
+def run_request_type_loading(json_file: str = "processed_request_types.json"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).load_request_types(json_file)
 
 
 def run_legacy_loading(csv_filename: str):
@@ -1338,6 +1752,10 @@ def run_template_load_and_approve(csv_filename: str):
     loader = FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY)
     created_ids = loader.load_templates(csv_filename)
     loader.approve_templates(csv_filename, id_map=created_ids)
+
+
+def run_template_pa_link_patch(csv_filename: str = "processed_templates.csv"):
+    FlaskLoader(FLASK_API_BASE_URL, FLASK_API_KEY).patch_template_pa_links(csv_filename)
 
 
 def run_vendor_loading(csv_filename: str = "processed_vendors.csv"):

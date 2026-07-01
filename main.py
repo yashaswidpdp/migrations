@@ -11,6 +11,7 @@ from scripts.extract.extract_odoo import (
     run_stakeholder_extraction,
     run_request_enrichment,
     run_consent_enrichment,
+    run_request_type_extraction,
 )
 from scripts.transform.transform_consent import transform_consent_data
 from scripts.transform.transform_request import transform_request_data
@@ -18,9 +19,11 @@ from scripts.transform.transform_processing_activity import transform_processing
 from scripts.transform.transform_template import transform_template_data
 from scripts.transform.transform_vendor import transform_vendor_data
 from scripts.transform.transform_stakeholder import transform_stakeholder_data
+from scripts.transform.transform_request_type import transform_request_type_data
 from scripts.load.load_flask import (
     run_loading,
     run_request_type_seeding,
+    run_request_type_loading,
     run_legacy_loading,
     run_paper_loading,
     run_consent_migration_loading,
@@ -29,6 +32,7 @@ from scripts.load.load_flask import (
     run_template_loading,
     run_template_approval,
     run_template_load_and_approve,
+    run_template_pa_link_patch,
     run_vendor_loading,
     run_stakeholder_loading,
 )
@@ -136,6 +140,68 @@ def run_all():
         click.echo(f"Error: {e}", err=True)
 
 # ==========================================
+# REQUEST TYPE COMMANDS  (master data — run before consents + requests)
+# ==========================================
+@cli.group(name="request-type")
+def request_type():
+    """Commands for migrating Request Types (Odoo /request-types -> Flask /request-types/create)"""
+    pass
+
+
+@request_type.command()
+def extract():
+    """Stage 1: Extract request types from Odoo -> data/raw/raw_request_types.json"""
+    logger.info("Starting request-type extraction...")
+    try:
+        run_request_type_extraction("raw_request_types.json")
+        click.echo("Extracted to data/raw/raw_request_types.json")
+    except Exception as e:
+        logger.error(f"Extraction failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command()
+def transform():
+    """Stage 1.5: Rename Odoo fields -> Flask -> data/processed/processed_request_types.json"""
+    logger.info("Starting request-type transformation...")
+    try:
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        click.echo("Transformation complete. Check data/processed/processed_request_types.json")
+    except Exception as e:
+        logger.error(f"Transformation failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command()
+def load():
+    """Stage 2: Load request types into Flask (idempotent by name)"""
+    logger.info("Starting request-type load...")
+    try:
+        run_request_type_loading("processed_request_types.json")
+        click.echo("Request-type loading complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Loading failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@request_type.command(name="run-all")
+def request_type_run_all():
+    """Run full pipeline: Extract -> Transform -> Load. Run before consents + requests."""
+    logger.info("Starting full request-type migration pipeline")
+    try:
+        click.echo("Stage 1: Extracting...")
+        run_request_type_extraction("raw_request_types.json")
+        click.echo("Stage 1.5: Transforming...")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        click.echo("Stage 2: Loading...")
+        run_request_type_loading("processed_request_types.json")
+        click.echo("Full request-type migration completed.")
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+# ==========================================
 # REQUEST COMMANDS
 # ==========================================
 @cli.group()
@@ -214,8 +280,10 @@ def run_all(user_id):
         click.echo("Stage 1.5: Transforming...")
         transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
 
-        click.echo("Stage 1.8: Seeding request types (idempotent)...")
-        run_request_type_seeding("request_types_seed.json")
+        click.echo("Stage 1.8: Loading request types from Odoo extract (idempotent)...")
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
 
         click.echo("Stage 2: Loading...")
         run_loading("processed_requests.csv", "/migration/request")
@@ -369,6 +437,21 @@ def approve():
         click.echo("Template approval complete. Check logs/migration.log for details.")
     except Exception as e:
         logger.error(f"Approval failed: {e}")
+        click.echo(f"Error: {e}", err=True)
+
+
+@template.command(name="patch-pa-links")
+def patch_pa_links():
+    """Backfill processing-activity links onto templates already in Flask.
+
+    Re-runnable + idempotent. Use after PAs are loaded (or after fixing PA
+    resolution) to wire template<->PA links without re-creating templates."""
+    logger.info("Starting Template PA-link patch...")
+    try:
+        run_template_pa_link_patch("processed_templates.csv")
+        click.echo("Template PA-link patch complete. Check logs/migration.log for details.")
+    except Exception as e:
+        logger.error(f"Template PA-link patch failed: {e}")
         click.echo(f"Error: {e}", err=True)
 
 
@@ -530,9 +613,21 @@ def stakeholder_run_all():
 @cli.command()
 @click.option("--no-write", is_flag=True, help="Print only; do not write the .txt report file.")
 @click.option("--self-test", "self_test", is_flag=True, help="Run internal consistency checks and exit.")
-def reconcile(no_write, self_test):
+@click.option("--live", is_flag=True, help="Verify against live Odoo (SOURCE) + live Flask app (MIGRATED); surfaces DRIFT. Reads tokens from config/.env.")
+@click.option("--cached-source", "cached_source", is_flag=True, help="With --live: take SOURCE from the data/raw snapshot instead of re-pulling Odoo (skips the full re-extract; field-diff + DRIFT still run live against Flask).")
+def reconcile(no_write, self_test, live, cached_source):
     """Audit Odoo->Flask completeness: per-entity source vs migrated ledger."""
+    import scripts.report.reconcile as recon
     from scripts.report.reconcile import run_reconciliation, self_test as _st, REPORT_PATH
+    if live:
+        recon.LIVE = True
+        if not (recon.FLASK_API_BASE_URL and recon.FLASK_API_KEY):
+            click.echo("WARN: --live set but FLASK_API_BASE_URL / FLASK_API_KEY missing in "
+                       "config/.env; dest verification will read n/a.", err=True)
+    if cached_source:
+        recon.CACHED_SOURCE = True
+        if not live:
+            click.echo("NOTE: --cached-source only affects --live runs.", err=True)
     if self_test:
         problems = _st()
         click.echo("SELF-TEST: " + ("PASS" if not problems else "FAIL"))
@@ -543,6 +638,122 @@ def reconcile(no_write, self_test):
     click.echo(report)
     if not no_write:
         click.echo(f"\n[written] {REPORT_PATH}")
+
+
+# ==========================================
+# FULL MIGRATION ORCHESTRATOR
+# One command, dependency-ordered, end-to-end. Kept self-contained: it reuses
+# the same run_* pipeline functions the per-entity `run-all` commands use, so it
+# never drifts from them.
+# ==========================================
+@cli.command(name="migrate-all")
+@click.option("--user-id", "user_id", type=int, default=None,
+              help="Flask user_id set as assigned_users on every request (passed to the request stage).")
+@click.option("--continue-on-error", is_flag=True,
+              help="Keep going if a stage fails. Default: abort, since later stages depend on earlier ones.")
+def migrate_all(user_id, continue_on_error):
+    """Run the ENTIRE migration end-to-end, in dependency order:
+
+      1. request-type   2. stakeholder   3. processing-activity
+      4. templates (+ PA<->template link backfill)   5. vendors
+      6. consents (DPCM)   7. requests (DPGR)
+
+    Each entity runs extract -> transform -> load (the same pipelines as the
+    per-entity `run-all`). Idempotent: safe to re-run — completed rows 409-skip.
+
+    PREREQUISITES (not done here): a running Flask app booted via
+    `migration_ext.serve`, and licenses seeded for the tenant
+    (`python -m migration_ext.ensure_license --tenant <id>`). Without licenses
+    the consent/request/vendor stages fail with "No active license".
+    """
+    import time
+
+    def _request_type():
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
+
+    def _stakeholder():
+        run_stakeholder_extraction("raw_stakeholders.json")
+        transform_stakeholder_data("raw_stakeholders.json", "processed_stakeholders.csv")
+        run_stakeholder_loading("processed_stakeholders.csv")
+
+    def _processing_activity():
+        run_pa_extraction("raw_processing_activities.json")
+        transform_processing_activity_data("raw_processing_activities.json",
+                                           "processed_processing_activities.csv")
+        run_pa_loading("processed_processing_activities.csv")
+        # PA link-patch is intentionally deferred to the template stage: templates
+        # don't exist yet, so patching template refs onto PAs here would no-op.
+
+    def _templates():
+        run_template_extraction("raw_templates.json")
+        transform_template_data("raw_templates.json", "processed_templates.csv")
+        run_template_load_and_approve("processed_templates.csv")
+        # Both PAs and templates now exist -> backfill BOTH link directions
+        # (template refs onto PAs, PA links onto templates). Idempotent.
+        run_pa_link_patch("processed_processing_activities.csv")
+        run_template_pa_link_patch("processed_templates.csv")
+
+    def _vendors():
+        run_vendor_extraction("raw_vendors.json")
+        transform_vendor_data("raw_vendors.json", "processed_vendors.csv")
+        run_vendor_loading("processed_vendors.csv")
+
+    def _consents():
+        run_extraction("/dpcm/dashboard", "raw_consents.csv")
+        run_consent_enrichment("raw_consents.csv")
+        transform_consent_data("raw_consents.csv", "processed_consents.csv")
+        run_consent_migration_loading("processed_consents.csv")
+
+    def _requests():
+        run_extraction("/dpgr/dashboard", "raw_requests.csv")
+        run_request_enrichment("raw_requests.csv")
+        transform_request_data("raw_requests.csv", "processed_requests.csv", assigned_user_id=user_id)
+        # Request types are master data for requests; idempotent reload mirrors
+        # `request run-all` so a stand-alone requests stage still resolves types.
+        run_request_type_extraction("raw_request_types.json")
+        transform_request_type_data("raw_request_types.json", "processed_request_types.json")
+        run_request_type_loading("processed_request_types.json")
+        run_loading("processed_requests.csv", "/migration/request")
+
+    pipeline = [
+        ("request-type", _request_type),
+        ("stakeholder", _stakeholder),
+        ("processing-activity", _processing_activity),
+        ("templates + PA links", _templates),
+        ("vendors", _vendors),
+        ("consents (DPCM)", _consents),
+        ("requests (DPGR)", _requests),
+    ]
+
+    bar = "=" * 64
+    logger.info("migrate-all: starting full migration (%d stages)", len(pipeline))
+    overall = time.time()
+    failed = []
+    for idx, (name, fn) in enumerate(pipeline, 1):
+        click.echo(f"\n{bar}\n### STAGE {idx}/{len(pipeline)}: {name}\n{bar}")
+        logger.info("migrate-all stage %d/%d start: %s", idx, len(pipeline), name)
+        t0 = time.time()
+        try:
+            fn()
+            click.echo(f"--- stage {idx} '{name}' OK ({time.time() - t0:.1f}s) ---")
+            logger.info("migrate-all stage %d done: %s (%.1fs)", idx, name, time.time() - t0)
+        except Exception as e:
+            failed.append(name)
+            logger.exception("migrate-all stage %d FAILED: %s: %s", idx, name, e)
+            click.echo(f"!!! stage {idx} '{name}' FAILED: {e}", err=True)
+            if not continue_on_error:
+                click.echo(f"\nABORTED at stage {idx} '{name}'. Fix the cause and re-run "
+                           f"`migrate-all` (idempotent — completed rows 409-skip), or pass "
+                           f"--continue-on-error to push past stage failures.", err=True)
+                raise SystemExit(1)
+
+    dur = time.time() - overall
+    if failed:
+        click.echo(f"\nmigrate-all finished WITH FAILURES in: {', '.join(failed)} ({dur:.0f}s total).", err=True)
+        raise SystemExit(1)
+    click.echo(f"\nmigrate-all COMPLETE — all {len(pipeline)} stages OK ({dur:.0f}s total).")
 
 
 if __name__ == "__main__":

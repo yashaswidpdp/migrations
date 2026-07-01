@@ -169,6 +169,30 @@ def transform_template_data(input_filename: str, output_filename: str):
         }
         records.append(record)
 
+    # Flask allows only ONE active default template per (template_type, language)
+    # and rejects a default that has processing activities. Approving a second
+    # default of the same group ARCHIVES the first (status=Archive,
+    # is_default=False) — which is why several Odoo "default"/"(copy)" templates
+    # were landing archived/inactive. Keep is_default on only the first PA-less
+    # default per group; demote the rest to non-default so they load as Active
+    # (just not the group default) instead of being archived.
+    seen_default_groups = set()
+    demoted = 0
+    for rec in records:
+        if not rec.get("is_default"):
+            continue
+        group = (rec.get("template_type"), rec.get("language"))
+        if rec.get("processing_activity_names") or group in seen_default_groups:
+            rec["is_default"] = False
+            demoted += 1
+        else:
+            seen_default_groups.add(group)
+    if demoted:
+        logger.info(
+            f"Demoted {demoted} duplicate/PA-bearing default template(s) to non-default "
+            f"(Flask keeps one default per template_type+language); they now load Active, not Archived."
+        )
+
     os.makedirs(DATA_PROCESSED_DIR, exist_ok=True)
     output_path = os.path.join(DATA_PROCESSED_DIR, output_filename)
 
